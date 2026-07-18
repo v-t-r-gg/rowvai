@@ -34,4 +34,4 @@ npm run tauri dev
 
 The unversioned 0.1 prototype format is not auto-imported because it omitted configuration needed for faithful recovery. Preserve old files and export visible values with the old build before recreating them. Migration compatibility begins with versioned format 1.
 
-Licensed under MIT or Apache-2.0.
+Licensed under the [Apache License, Version 2.0](LICENSE).
