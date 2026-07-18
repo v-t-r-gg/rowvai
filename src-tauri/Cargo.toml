@@ -1,0 +1,36 @@
+[package]
+name = "rowva"
+version = "0.1.0"
+edition = "2021"
+description = "Rowva — Local-first relational spreadsheet CRM"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rowva_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Storage — portable .rowva SQLite
+rusqlite = { version = "0.38", features = ["bundled", "chrono", "serde_json"] }
+
+# IDs + timestamps
+uuid = { version = "1.10", features = ["v4", "serde", "fast-rng"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Graphs (relational rollups)
+petgraph = { version = "0.8", features = ["serde"] }
+
+# ★ Formula + incremental recalc engine (320+ Excel functions + dep graph)
+formualizer-workbook = "0.4"
+
+# Error handling + logging
+anyhow = "1.0"
+thiserror = "2.0"
+log = "0.4"
