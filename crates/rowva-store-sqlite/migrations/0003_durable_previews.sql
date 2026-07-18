@@ -1,0 +1,10 @@
+ALTER TABLE _rowva_operations ADD COLUMN preview_fingerprint TEXT;
+ALTER TABLE _rowva_operations ADD COLUMN correlation_json TEXT;
+ALTER TABLE _rowva_operations ADD COLUMN policy_decision TEXT;
+ALTER TABLE _rowva_operations ADD COLUMN state_witnesses_json TEXT;
+ALTER TABLE _rowva_actors ADD COLUMN actor_version TEXT;
+ALTER TABLE _rowva_actors ADD COLUMN human_principal_id TEXT;
+ALTER TABLE _rowva_actors ADD COLUMN client_name TEXT;
+ALTER TABLE _rowva_actors ADD COLUMN session_id TEXT;
+CREATE INDEX _rowva_operations_history ON _rowva_operations(created_at DESC, id DESC);
+CREATE INDEX _rowva_operation_changes_record ON _rowva_operation_changes(record_id, operation_id);

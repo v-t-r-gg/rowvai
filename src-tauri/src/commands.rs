@@ -1,178 +1,319 @@
-use tauri::{State, Manager};
-use crate::engine::RowvaWorkbook;     // now works via re-export
-use crate::engine::table::{Column, Table};
-use crate::storage;
-use std::sync::Mutex;
+//! Thin Tauri compatibility adapter over the shared Rowva application protocol.
+use rowva_core::{
+    ActorContext, ApprovalRequest, ApprovalRequestId, Command, FieldDefinition, FieldId, FieldKind,
+    ObjectId, OperationId, OperationPreview, OperationReceipt, OperationRecord, OperationRequest,
+    RecordId, RecordRevision, RevisionResult, RowvaApplication, RowvaError, TextConfig,
+};
+use rowva_store_sqlite::SqliteApplication;
+use serde::Serialize;
 use serde_json::{json, Value};
-use anyhow::Error;                    // ← for explicit map_err type
+use std::{collections::HashMap, path::Path, sync::Mutex};
+use tauri::{Manager, State};
 
 #[derive(Default)]
 pub struct AppState {
-    current_workbook: Mutex<Option<RowvaWorkbook>>,
+    current: Mutex<Option<SqliteApplication>>,
+}
+#[derive(Serialize)]
+pub struct GridColumn {
+    id: FieldId,
+    label: String,
+    col_type: FieldKind,
+}
+#[derive(Serialize)]
+pub struct GridData {
+    columns: Vec<GridColumn>,
+    rows: Vec<Value>,
+}
+
+fn lock<'a>(
+    state: &'a State<'_, AppState>,
+) -> Result<std::sync::MutexGuard<'a, Option<SqliteApplication>>, RowvaError> {
+    state.current.lock().map_err(|_| RowvaError::Internal {
+        code: "desktop_state_poisoned".into(),
+    })
+}
+fn app_mut(slot: &mut Option<SqliteApplication>) -> Result<&mut SqliteApplication, RowvaError> {
+    slot.as_mut()
+        .ok_or_else(|| RowvaError::validation("no_workspace_open", "no workspace is open"))
 }
 
 #[tauri::command]
-pub fn new_workbook(state: State<AppState>, name: String, app: tauri::AppHandle) -> Result<String, String> {
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let file_path = data_dir.join(format!("{}.rowva", name.to_lowercase().replace(' ', "_")));
-
-    let wb: RowvaWorkbook = RowvaWorkbook::create(name, file_path.clone())
-        .map_err(|e: Error| e.to_string())?;   // explicit type fixes E0282
-
-    let mut guard = state.current_workbook.lock().unwrap();
-    *guard = Some(wb);
-    Ok(file_path.to_string_lossy().to_string())
+pub fn new_workbook(
+    state: State<'_, AppState>,
+    name: String,
+    app: tauri::AppHandle,
+) -> Result<String, RowvaError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| RowvaError::Internal {
+            code: "app_data_directory_unavailable".into(),
+        })?;
+    std::fs::create_dir_all(&data_dir).map_err(|_| RowvaError::Storage {
+        code: "create_app_data_directory_failed".into(),
+    })?;
+    let safe_name = name
+        .to_lowercase()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let path = data_dir.join(format!("{}.rowva", safe_name.trim_matches('_')));
+    *lock(&state)? = Some(SqliteApplication::create(&path, &name)?);
+    Ok(path.to_string_lossy().into_owned())
 }
-
 #[tauri::command]
-#[allow(non_snake_case)]
-pub fn create_table(state: State<AppState>, displayName: String) -> Result<String, String> {
-    let mut guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_mut().ok_or("No workbook open".to_string())?;
-
-    let conn = storage::open_workbook(&wb.path).map_err(|e| e.to_string())?;
-    let table = storage::create_table(&conn, &displayName).map_err(|e| e.to_string())?;
-
-    wb.tables.insert(table.id.clone(), table.clone());
-    Ok(table.id)
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-pub fn add_column(state: State<AppState>, tableId: String, label: String) -> Result<Column, String> {
-    let mut guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_mut().ok_or("No workbook open".to_string())?;
-
-    let conn = storage::open_workbook(&wb.path).map_err(|e| e.to_string())?;
-    let column = storage::add_column(&conn, &tableId, &label).map_err(|e| e.to_string())?;
-
-    if let Some(table) = wb.tables.get_mut(&tableId) {
-        table.columns.push(column.clone());
-    }
-    Ok(column)
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-pub fn get_grid_data(state: State<AppState>, tableId: String) -> Result<Value, String> {
-    let guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_ref().ok_or("No workbook open".to_string())?;
-    let table = wb.tables.get(&tableId).ok_or("Table not found".to_string())?;
-
-    let conn = storage::open_workbook(&wb.path).map_err(|e| e.to_string())?;
-    let rows = storage::get_table_rows(&conn, &table.name, &table.columns).map_err(|e| e.to_string())?;
-
-    let cols_json = table.columns.iter().map(|c| {
-        json!({ "id": c.id, "label": c.label, "col_type": "Text" })
-    }).collect::<Vec<_>>();
-
-    Ok(json!({ "columns": cols_json, "rows": rows }))
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-pub fn insert_row(
-    state: State<AppState>,
-    tableId: String,
-    values: std::collections::HashMap<String, String>, // label -> value (for simplicity in first slice)
-) -> Result<String, String> {
-    let mut guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_mut().ok_or("No workbook open".to_string())?;
-    let table = wb.tables.get(&tableId).ok_or("Table not found".to_string())?;
-
-    // Build map from label -> col_id for this table
-    let label_to_col: std::collections::HashMap<_, _> = table
-        .columns
-        .iter()
-        .map(|c| (c.label.clone(), c.id.clone()))
-        .collect();
-
-    let mut col_values: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
-    for (label, val) in values {
-        if let Some(col_id) = label_to_col.get(&label) {
-            col_values.insert(col_id.clone(), if val.is_empty() { None } else { Some(val) });
-        }
-    }
-
-    let conn = storage::open_workbook(&wb.path).map_err(|e| e.to_string())?;
-    let row_id = storage::insert_row(&conn, &table.name, &col_values).map_err(|e| e.to_string())?;
-
-    Ok(row_id)
-}
-
-#[tauri::command]
-pub fn open_workbook(state: State<AppState>, path: String) -> Result<String, String> {
-    let conn = storage::open_workbook(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
-
-    let mut loaded_tables: Vec<Table> = storage::load_all_tables(&conn).map_err(|e| e.to_string())?;
-
-    for table in &mut loaded_tables {
-        let cols = storage::load_columns_for_table(&conn, &table.id).map_err(|e| e.to_string())?;
-        table.columns = cols;
-    }
-
-    let mut tables_map = std::collections::HashMap::new();
-    for t in loaded_tables {
-        tables_map.insert(t.id.clone(), t);
-    }
-
-    let wb = RowvaWorkbook {
-        id: uuid::Uuid::new_v4(),
-        name: std::path::Path::new(&path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Workbook")
-            .to_string(),
-        path: std::path::PathBuf::from(&path),
-        tables: tables_map,
-    };
-
-    let mut guard = state.current_workbook.lock().unwrap();
-    *guard = Some(wb);
-
+pub fn open_workbook(state: State<'_, AppState>, path: String) -> Result<String, RowvaError> {
+    *lock(&state)? = Some(SqliteApplication::open(Path::new(&path))?);
     Ok(path)
 }
-
 #[tauri::command]
-pub fn get_tables(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
-    let guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_ref().ok_or("No workbook open".to_string())?;
-
-    let tables = wb.tables.values().map(|t| {
-        serde_json::json!({
-            "id": t.id,
-            "display_name": t.display_name,
+pub fn create_table(
+    state: State<'_, AppState>,
+    display_name: String,
+) -> Result<String, RowvaError> {
+    let mut slot = lock(&state)?;
+    let response = app_mut(&mut slot)?.execute(OperationRequest::new(
+        ActorContext::local_user(),
+        Command::CreateObject {
+            display_name,
+            key: None,
+        },
+    ))?;
+    response
+        .result
+        .and_then(|v| v["object_id"].as_str().map(str::to_owned))
+        .ok_or(RowvaError::Internal {
+            code: "missing_object_result".into(),
         })
-    }).collect();
-
-    Ok(tables)
 }
-
 #[tauri::command]
-#[allow(non_snake_case)]
+pub fn add_column(
+    state: State<'_, AppState>,
+    table_id: String,
+    label: String,
+) -> Result<FieldDefinition, RowvaError> {
+    let object_id = ObjectId::from_string(table_id)?;
+    let mut slot = lock(&state)?;
+    let application = app_mut(&mut slot)?;
+    application.execute(OperationRequest::new(
+        ActorContext::local_user(),
+        Command::CreateField {
+            object_id: object_id.clone(),
+            display_name: label,
+            key: None,
+            kind: FieldKind::Text(TextConfig::default()),
+            required: false,
+            unique: false,
+        },
+    ))?;
+    application
+        .list_fields(&object_id)?
+        .pop()
+        .ok_or(RowvaError::Internal {
+            code: "missing_field_result".into(),
+        })
+}
+#[tauri::command]
+pub fn get_tables(state: State<'_, AppState>) -> Result<Vec<Value>, RowvaError> {
+    let mut slot = lock(&state)?;
+    Ok(app_mut(&mut slot)?
+        .list_objects()?
+        .into_iter()
+        .map(|o| json!({"id":o.id,"display_name":o.display_name}))
+        .collect())
+}
+#[tauri::command]
+pub fn get_grid_data(state: State<'_, AppState>, table_id: String) -> Result<GridData, RowvaError> {
+    let object_id = ObjectId::from_string(table_id)?;
+    let mut slot = lock(&state)?;
+    let application = app_mut(&mut slot)?;
+    let columns = application
+        .list_fields(&object_id)?
+        .into_iter()
+        .map(|f| GridColumn {
+            id: f.id,
+            label: f.display_name,
+            col_type: f.kind,
+        })
+        .collect();
+    let rows = application
+        .list_records(&object_id)?
+        .into_iter()
+        .map(|r| json!({"record_id":r.record_id,"revision":r.revision,"values":r.values}))
+        .collect();
+    Ok(GridData { columns, rows })
+}
+#[tauri::command]
+pub fn insert_row(
+    state: State<'_, AppState>,
+    table_id: String,
+    values: HashMap<String, Value>,
+) -> Result<String, RowvaError> {
+    let object_id = ObjectId::from_string(table_id)?;
+    let values = values
+        .into_iter()
+        .map(|(id, v)| Ok((FieldId::from_string(id)?, v)))
+        .collect::<Result<HashMap<_, _>, RowvaError>>()?;
+    let mut slot = lock(&state)?;
+    let response = app_mut(&mut slot)?.execute(OperationRequest::new(
+        ActorContext::local_user(),
+        Command::CreateRecord {
+            object_id,
+            record_id: None,
+            values,
+        },
+    ))?;
+    response
+        .result
+        .and_then(|v| v["record_id"].as_str().map(str::to_owned))
+        .ok_or(RowvaError::Internal {
+            code: "missing_record_result".into(),
+        })
+}
+#[tauri::command]
 pub fn update_cell(
-    state: State<AppState>,
-    tableId: String,
-    rowId: String,
-    colId: String,   // internal column id (c_xxx)
-    value: String,
-) -> Result<(), String> {
-    let guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_ref().ok_or("No workbook open".to_string())?;
-    let table = wb.tables.get(&tableId).ok_or("Table not found".to_string())?;
-
-    let conn = storage::open_workbook(&wb.path).map_err(|e| e.to_string())?;
-    storage::update_cell(&conn, &table.name, &rowId, &colId, if value.is_empty() { None } else { Some(&value) })
-        .map_err(|e| e.to_string())
+    state: State<'_, AppState>,
+    table_id: String,
+    row_id: String,
+    col_id: String,
+    value: Value,
+    expected_revision: Option<i64>,
+) -> Result<Value, RowvaError> {
+    let mut values = HashMap::new();
+    values.insert(FieldId::from_string(col_id)?, value);
+    let mut slot = lock(&state)?;
+    let response = app_mut(&mut slot)?.execute(OperationRequest::new(
+        ActorContext::local_user(),
+        Command::UpdateRecord {
+            object_id: ObjectId::from_string(table_id)?,
+            record_id: RecordId::from_string(row_id)?,
+            values,
+            expected_revision: expected_revision.map(RecordRevision),
+        },
+    ))?;
+    response.result.ok_or(RowvaError::Internal {
+        code: "missing_update_result".into(),
+    })
+}
+#[tauri::command]
+pub fn delete_row_cmd(
+    state: State<'_, AppState>,
+    table_id: String,
+    row_id: String,
+    expected_revision: Option<i64>,
+) -> Result<(), RowvaError> {
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.execute(OperationRequest::new(
+        ActorContext::local_user(),
+        Command::DeleteRecord {
+            object_id: ObjectId::from_string(table_id)?,
+            record_id: RecordId::from_string(row_id)?,
+            expected_revision: expected_revision.map(RecordRevision),
+        },
+    ))?;
+    Ok(())
 }
 
 #[tauri::command]
-#[allow(non_snake_case)]
-pub fn delete_row_cmd(state: State<AppState>, tableId: String, rowId: String) -> Result<(), String> {
-    let guard = state.current_workbook.lock().unwrap();
-    let wb = guard.as_ref().ok_or("No workbook open".to_string())?;
-    let table = wb.tables.get(&tableId).ok_or("Table not found".to_string())?;
+pub fn list_approval_inbox(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<ApprovalRequest>, RowvaError> {
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.list_approvals(limit.unwrap_or(50))
+}
+#[tauri::command]
+pub fn get_approval_detail(
+    state: State<'_, AppState>,
+    approval_request_id: String,
+) -> Result<ApprovalRequest, RowvaError> {
+    let id = ApprovalRequestId::from_string(approval_request_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.get_approval(&id)
+}
+#[tauri::command]
+pub fn approve_and_execute_operation(
+    state: State<'_, AppState>,
+    approval_request_id: String,
+    proposal_fingerprint: String,
+    reason: Option<String>,
+) -> Result<OperationReceipt, RowvaError> {
+    let id = ApprovalRequestId::from_string(approval_request_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.approve_and_execute(
+        &id,
+        &proposal_fingerprint,
+        &ActorContext::local_user(),
+        reason,
+    )
+}
+#[tauri::command]
+pub fn reject_operation(
+    state: State<'_, AppState>,
+    approval_request_id: String,
+    reason: Option<String>,
+) -> Result<ApprovalRequest, RowvaError> {
+    let id = ApprovalRequestId::from_string(approval_request_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.reject_approval(&id, &ActorContext::local_user(), reason)
+}
+#[tauri::command]
+pub fn revise_operation(
+    state: State<'_, AppState>,
+    approval_request_id: String,
+    replacement_values: HashMap<String, Value>,
+    reason: Option<String>,
+) -> Result<RevisionResult, RowvaError> {
+    let values = replacement_values
+        .into_iter()
+        .map(|(id, v)| Ok((FieldId::from_string(id)?, v)))
+        .collect::<Result<HashMap<_, _>, RowvaError>>()?;
+    let id = ApprovalRequestId::from_string(approval_request_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.revise_approval(&id, &ActorContext::local_user(), values, reason)
+}
+#[tauri::command]
+pub fn preview_operation_undo(
+    state: State<'_, AppState>,
+    operation_id: String,
+    reason: Option<String>,
+) -> Result<OperationPreview, RowvaError> {
+    let id = OperationId::from_string(operation_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.preview_undo(&id, &ActorContext::local_user(), reason)
+}
+#[tauri::command]
+pub fn commit_operation_undo(
+    state: State<'_, AppState>,
+    operation_id: String,
+    preview_fingerprint: String,
+) -> Result<OperationReceipt, RowvaError> {
+    let id = OperationId::from_string(operation_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.commit_preview(&ActorContext::local_user(), &id, &preview_fingerprint)
+}
+#[tauri::command]
+pub fn list_operation_history(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<OperationRecord>, RowvaError> {
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.list_operations(limit.unwrap_or(50))
+}
+#[tauri::command]
+pub fn get_operation_detail(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<OperationRecord, RowvaError> {
+    let id = OperationId::from_string(operation_id)?;
+    let mut slot = lock(&state)?;
+    app_mut(&mut slot)?.get_operation(&id)
+}
 
-    let conn = storage::open_workbook(&wb.path).map_err(|e| e.to_string())?;
-    storage::delete_row(&conn, &table.name, &rowId).map_err(|e| e.to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn adapter_rejects_display_labels_as_ids() {
+        assert!(ObjectId::from_string("Contacts").is_err());
+    }
 }

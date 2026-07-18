@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/rowva-core", "crates/rowva-store-sqlite", "crates/rowva-mcp", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.38", features = ["bundled", "chrono", "serde_json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1.10", features = ["v4", "serde", "fast-rng"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

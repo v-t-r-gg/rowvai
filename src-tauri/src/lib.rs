@@ -1,7 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod storage;
-mod engine;
 mod commands;
 
 use tauri::Manager;
@@ -24,7 +22,16 @@ pub fn run() {
             commands::get_tables,
             commands::update_cell,
             commands::delete_row_cmd,
-])
+            commands::list_approval_inbox,
+            commands::get_approval_detail,
+            commands::approve_and_execute_operation,
+            commands::reject_operation,
+            commands::revise_operation,
+            commands::preview_operation_undo,
+            commands::commit_operation_undo,
+            commands::list_operation_history,
+            commands::get_operation_detail,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
