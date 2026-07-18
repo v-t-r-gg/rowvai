@@ -4,6 +4,8 @@ RowvAI is the public product name. Existing `rowva` internal namespaces and prot
 
 Shadow mode is parallel recommendation, not preview, approval, or execution. RowvAI seals a minimal deal-stage case before a human outcome is exposed. External agents receive the same frozen bundle and submit attributable recommendations. Candidates never enter `_rowva_operations` or the approval inbox and have no commit identity.
 
+Dataset curation, terminal invalidation, immutable analysis runs, duplicate diagnostics, and confidence calibration are documented in [evaluation dataset quality](evaluation-data-quality.md). Live reports exclude invalidated cases by default; historical evidence remains inspectable.
+
 ## First workflow
 
 `deal_stage_qualification_v1` freezes immutable object, record, and stage-field IDs; schema and record revisions; the complete configured stage field; selected record values; structured synthetic meeting evidence; and a permitted-output schema. Missing optional selected values are represented as JSON `null`. Only an exact, single-value `StageUpdateProposalV1` against the frozen target and revision is valid; the general operation `Command` protocol is not accepted. No-change and abstain are explicit decisions.

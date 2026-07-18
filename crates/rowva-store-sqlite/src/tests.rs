@@ -42,12 +42,15 @@ fn field(app: &mut SqliteApplication, object_id: &ObjectId, kind: FieldKind) -> 
 #[test]
 fn initializes_migrates_reopens_and_migrations_are_idempotent() {
     let (_dir, path, app) = setup();
-    assert_eq!(app.migration_versions().unwrap(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(app.migration_versions().unwrap(), vec![1, 2, 3, 4, 5, 6]);
     let id = app.workspace_id().clone();
     drop(app);
     let reopened = SqliteApplication::open(&path).unwrap();
     assert_eq!(reopened.workspace_id(), &id);
-    assert_eq!(reopened.migration_versions().unwrap(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        reopened.migration_versions().unwrap(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
 }
 
 #[test]
@@ -1139,5 +1142,205 @@ fn human_reference_requires_exact_revision_and_stage_only_command() {
     );
     assert!(
         matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:extra.operation_id}),Err(RowvaError::Validation{code,..}) if code=="human_operation_target_mismatch"||code=="human_operation_extra_changes")
+    );
+}
+
+#[test]
+fn immutable_dataset_analysis_and_terminal_invalidation_are_durable() {
+    let (_dir, path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let agent = eval_agent("quality-v1");
+    app.submit_evaluation_candidate(CandidateImport {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        bundle_digest: case.bundle_digest.clone(),
+        actor: agent.clone(),
+        decision: ShadowDecision::NoChange {
+            reason: Some("SYNTHETIC_PRIVATE_REASON".into()),
+        },
+        reason: None,
+        confidence: Some(0.8),
+    })
+    .unwrap();
+    app.record_evaluation_outcome(
+        &case.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: Some("synthetic reference".into()),
+        },
+    )
+    .unwrap();
+    let duplicate = eval_case(&mut app, &object, &stage, &record);
+    app.submit_evaluation_candidate(CandidateImport {
+        protocol_version: 1,
+        case_id: duplicate.id.clone(),
+        bundle_digest: duplicate.bundle_digest.clone(),
+        actor: agent.clone(),
+        decision: ShadowDecision::NoChange { reason: None },
+        reason: None,
+        confidence: Some(0.8),
+    })
+    .unwrap();
+    app.record_evaluation_outcome(
+        &duplicate.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: None,
+        },
+    )
+    .unwrap();
+    let dataset = app
+        .create_evaluation_dataset(EvaluationDatasetCreateV1 {
+            protocol_version: 1,
+            name: "Synthetic quality set".into(),
+            description: None,
+            selection: EvaluationDatasetSelectionV1::Explicit {
+                case_ids: vec![case.id.clone(), duplicate.id.clone()],
+            },
+            creator: ActorContext::local_user(),
+        })
+        .unwrap();
+    assert_eq!(dataset.manifest.case_members.len(), 2);
+    assert!(app
+        .conn
+        .execute(
+            "UPDATE _rowva_evaluation_datasets SET created_at=created_at WHERE id=?1",
+            [dataset.manifest.dataset_id.as_str()]
+        )
+        .is_err());
+    assert!(app
+        .conn
+        .execute(
+            "DELETE FROM _rowva_evaluation_dataset_cases WHERE dataset_id=?1",
+            [dataset.manifest.dataset_id.as_str()]
+        )
+        .is_err());
+    let request = EvaluationAnalysisRequestV1 {
+        protocol_version: 1,
+        dataset_id: dataset.manifest.dataset_id.clone(),
+        actor_id: agent.id.clone(),
+        actor_version: "quality-v1".into(),
+        scorer_revision: 1,
+        readiness_rubric_revision: 1,
+        quality_revision: 1,
+        calibration_revision: 1,
+    };
+    let first = app.run_evaluation_analysis(request.clone()).unwrap();
+    assert!(app
+        .conn
+        .execute(
+            "DELETE FROM _rowva_evaluation_analysis_runs WHERE id=?1",
+            [first.id.as_str()]
+        )
+        .is_err());
+    assert_eq!(
+        first.report.included_case_ids,
+        vec![case.id.clone(), duplicate.id.clone()]
+    );
+    assert_eq!(first.report.quality.duplicate_content_groups.len(), 1);
+    assert_eq!(first.report.quality.repeated_evidence_groups.len(), 1);
+    assert_eq!(
+        app.run_evaluation_analysis(request.clone()).unwrap().id,
+        first.id
+    );
+    let metadata = app
+        .export_evaluation_dataset(
+            &dataset.manifest.dataset_id,
+            EvaluationExportProfile::Metadata,
+        )
+        .unwrap();
+    let encoded = serde_json::to_string(&metadata).unwrap();
+    assert!(!encoded.contains("SYNTHETIC_PRIVATE_REASON"));
+    assert!(!metadata.payload.contains_sensitive_values);
+    assert_eq!(
+        sha256_digest(&metadata.payload).unwrap(),
+        metadata.export_digest
+    );
+    let full = app
+        .export_evaluation_dataset(
+            &dataset.manifest.dataset_id,
+            EvaluationExportProfile::FullLocal,
+        )
+        .unwrap();
+    assert!(full.payload.contains_sensitive_values);
+    let invalidation = app
+        .invalidate_evaluation_case(EvaluationInvalidationInput {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            category: EvaluationInvalidationCategory::IncorrectInput,
+            reason: "synthetic contamination".into(),
+            actor: ActorContext::local_user(),
+            related_case_id: None,
+        })
+        .unwrap();
+    assert_eq!(invalidation.previous_status, EvaluationCaseStatus::Scored);
+    assert_eq!(app.get_evaluation_analysis(&first.id).unwrap(), first);
+    let second = app.run_evaluation_analysis(request).unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.report.included_case_ids, vec![duplicate.id.clone()]);
+    assert_eq!(
+        second
+            .report
+            .excluded_cases
+            .get(&case.id)
+            .map(String::as_str),
+        Some("invalidated")
+    );
+    let current_report = app.evaluation_report().unwrap();
+    assert_eq!(current_report.len(), 1);
+    assert_eq!(current_report[0].counts.cases_available, 1);
+    assert_eq!(current_report[0].counts.scored_eligible, 1);
+    drop(app);
+    let reopened = SqliteApplication::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_evaluation_dataset(&dataset.manifest.dataset_id)
+            .unwrap()
+            .dataset_digest,
+        dataset.dataset_digest
+    );
+}
+
+#[test]
+fn collecting_invalidation_closes_candidate_and_outcome_paths() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let denied = app.invalidate_evaluation_case(EvaluationInvalidationInput {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        category: EvaluationInvalidationCategory::Other,
+        reason: "agent cannot decide this".into(),
+        actor: eval_agent("1"),
+        related_case_id: None,
+    });
+    assert!(
+        matches!(denied,Err(RowvaError::PermissionDenied{code,..}) if code=="evaluation_invalidation_actor_denied")
+    );
+    app.invalidate_evaluation_case(EvaluationInvalidationInput {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        category: EvaluationInvalidationCategory::PrivacyOrRetentionRequest,
+        reason: "remove from active evaluation".into(),
+        actor: ActorContext::local_user(),
+        related_case_id: None,
+    })
+    .unwrap();
+    assert!(app
+        .submit_evaluation_candidate(no_change_candidate(&case, "after"))
+        .is_err());
+    assert!(app
+        .record_evaluation_outcome(
+            &case.id,
+            HumanEvaluationOutcomeInput::NoChange {
+                actor: ActorContext::local_user(),
+                reason: None
+            }
+        )
+        .is_err());
+    assert_eq!(
+        app.get_evaluation_case(&case.id).unwrap().status,
+        EvaluationCaseStatus::Invalidated
     );
 }

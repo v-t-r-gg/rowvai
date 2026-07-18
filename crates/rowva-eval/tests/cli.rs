@@ -94,7 +94,7 @@ fn process_case_export_import_outcome_replay_and_report() {
         relevant_field_ids: vec![],
         input: DealStageQualificationInputV1 {
             source_meeting_id: Some("synthetic".into()),
-            meeting_evidence: json!({"qualification":true}),
+            meeting_evidence: json!({"note":"SYNTHETIC_PRIVATE_MEETING_TEXT"}),
             current_stage: json!("Discovery"),
         },
         creator: actor.clone(),
@@ -192,4 +192,90 @@ fn process_case_export_import_outcome_replay_and_report() {
     let report = call(&["report", "--workspace", workspace.to_str().unwrap()]);
     assert!(report.status.success());
     assert!(String::from_utf8_lossy(&report.stdout).contains("insufficient_evidence"));
+    let dataset_input = EvaluationDatasetCreateV1 {
+        protocol_version: 1,
+        name: "CLI dataset".into(),
+        description: None,
+        selection: EvaluationDatasetSelectionV1::Explicit {
+            case_ids: vec![case.id.clone()],
+        },
+        creator: ActorContext::local_user(),
+    };
+    let dataset_file = dir.path().join("dataset.json");
+    std::fs::write(&dataset_file, serde_json::to_vec(&dataset_input).unwrap()).unwrap();
+    let dataset_output = call(&[
+        "dataset",
+        "create",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--input",
+        dataset_file.to_str().unwrap(),
+    ]);
+    assert!(
+        dataset_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dataset_output.stderr)
+    );
+    let dataset: EvaluationDataset = serde_json::from_slice(&dataset_output.stdout).unwrap();
+    let analysis_input = EvaluationAnalysisRequestV1 {
+        protocol_version: 1,
+        dataset_id: dataset.manifest.dataset_id.clone(),
+        actor_id: ActorId::from_string("act_cli_shadow").unwrap(),
+        actor_version: "1.0".into(),
+        scorer_revision: 1,
+        readiness_rubric_revision: 1,
+        quality_revision: 1,
+        calibration_revision: 1,
+    };
+    let analysis_file = dir.path().join("analysis.json");
+    std::fs::write(&analysis_file, serde_json::to_vec(&analysis_input).unwrap()).unwrap();
+    assert!(call(&[
+        "analysis",
+        "run",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--input",
+        analysis_file.to_str().unwrap()
+    ])
+    .status
+    .success());
+    let metadata = call(&[
+        "dataset",
+        "export",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--dataset-id",
+        dataset.manifest.dataset_id.as_str(),
+        "--profile",
+        "metadata",
+    ]);
+    assert!(metadata.status.success());
+    assert!(String::from_utf8_lossy(&metadata.stdout).contains("metadata_only"));
+    assert!(!String::from_utf8_lossy(&metadata.stdout).contains("SYNTHETIC_PRIVATE_MEETING_TEXT"));
+    let sensitive = dir.path().join("full-local.json");
+    assert!(call(&[
+        "dataset",
+        "export",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--dataset-id",
+        dataset.manifest.dataset_id.as_str(),
+        "--profile",
+        "full_local",
+        "--output",
+        sensitive.to_str().unwrap()
+    ])
+    .status
+    .success());
+    let sensitive_text = std::fs::read_to_string(&sensitive).unwrap();
+    assert!(sensitive_text.contains("full_local_sensitive"));
+    assert!(sensitive_text.contains("SYNTHETIC_PRIVATE_MEETING_TEXT"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&sensitive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

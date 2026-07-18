@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rowva_core::*;
 use rowva_store_sqlite::SqliteApplication;
 use serde::de::DeserializeOwned;
@@ -53,6 +53,14 @@ enum Top {
         #[arg(long)]
         workspace: PathBuf,
     },
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
+    Analysis {
+        #[command(subcommand)]
+        command: AnalysisCommand,
+    },
 }
 #[derive(Subcommand)]
 enum Fixture {
@@ -60,6 +68,16 @@ enum Fixture {
 }
 #[derive(Subcommand)]
 enum Case {
+    List {
+        #[arg(long)]
+        workspace: PathBuf,
+    },
+    Invalidate {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+    },
     Create {
         #[arg(long)]
         workspace: PathBuf,
@@ -78,6 +96,70 @@ enum Case {
         #[arg(long)]
         case_id: String,
     },
+}
+#[derive(Subcommand)]
+enum DatasetCommand {
+    Create {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        workspace: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        dataset_id: String,
+    },
+    Quality {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        dataset_id: String,
+        #[arg(long)]
+        actor_id: String,
+        #[arg(long)]
+        actor_version: String,
+    },
+    Export {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        dataset_id: String,
+        #[arg(long, value_enum, default_value = "metadata")]
+        profile: ExportProfileArg,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+#[derive(Subcommand)]
+enum AnalysisCommand {
+    Run {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        workspace: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        analysis_id: String,
+    },
+}
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum ExportProfileArg {
+    Metadata,
+    #[value(name = "full_local", alias = "full-local")]
+    FullLocal,
 }
 #[derive(Subcommand)]
 enum Candidate {
@@ -182,6 +264,37 @@ fn output<T: serde::Serialize>(value: &T, json_mode: bool) -> Result<(), RowvaEr
         code: "output_serialization_failed".into(),
     })?;
     println!("{encoded}");
+    Ok(())
+}
+fn write_sensitive_export(path: &Path, value: &EvaluationDatasetExport) -> Result<(), RowvaError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|_| {
+        RowvaError::validation("export_serialization_failed", "unable to serialize export")
+    })?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|_| {
+                RowvaError::validation(
+                    "export_write_failed",
+                    "full-local export output must be a new writable file",
+                )
+            })?;
+        file.write_all(&bytes).map_err(|_| {
+            RowvaError::validation("export_write_failed", "unable to write full-local export")
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).map_err(|_| {
+            RowvaError::validation("export_write_failed", "unable to write full-local export")
+        })?;
+    }
     Ok(())
 }
 fn commit(app: &mut SqliteApplication, command: Command) -> Result<OperationResponse, RowvaError> {
@@ -465,6 +578,15 @@ fn run_fixture_file(file: FixtureFile) -> Result<FixtureSummary, RowvaError> {
 fn run(cli: Cli) -> Result<(), RowvaError> {
     match cli.command {
         Top::Case {
+            command: Case::List { workspace },
+        } => output(&open(&workspace)?.list_evaluation_cases()?, cli.json),
+        Top::Case {
+            command: Case::Invalidate { workspace, input },
+        } => {
+            let mut app = open(&workspace)?;
+            output(&app.invalidate_evaluation_case(read(&input)?)?, cli.json)
+        }
+        Top::Case {
             command: Case::Create { workspace, input },
         } => {
             let mut app = open(&workspace)?;
@@ -510,6 +632,113 @@ fn run(cli: Cli) -> Result<(), RowvaError> {
             cli.json,
         ),
         Top::Report { workspace } => output(&open(&workspace)?.evaluation_report()?, cli.json),
+        Top::Dataset {
+            command: DatasetCommand::Create { workspace, input },
+        } => {
+            let mut app = open(&workspace)?;
+            output(&app.create_evaluation_dataset(read(&input)?)?, cli.json)
+        }
+        Top::Dataset {
+            command: DatasetCommand::List { workspace },
+        } => output(&open(&workspace)?.list_evaluation_datasets()?, cli.json),
+        Top::Dataset {
+            command:
+                DatasetCommand::Show {
+                    workspace,
+                    dataset_id,
+                },
+        } => output(
+            &open(&workspace)?
+                .get_evaluation_dataset(&EvaluationDatasetId::from_string(dataset_id)?)?,
+            cli.json,
+        ),
+        Top::Dataset {
+            command:
+                DatasetCommand::Quality {
+                    workspace,
+                    dataset_id,
+                    actor_id,
+                    actor_version,
+                },
+        } => {
+            let mut app = open(&workspace)?;
+            let dataset_id = EvaluationDatasetId::from_string(dataset_id)?;
+            let run = app.run_evaluation_analysis(EvaluationAnalysisRequestV1 {
+                protocol_version: 1,
+                dataset_id,
+                actor_id: ActorId::from_string(actor_id)?,
+                actor_version,
+                scorer_revision: 1,
+                readiness_rubric_revision: 1,
+                quality_revision: 1,
+                calibration_revision: 1,
+            })?;
+            output(&run.report.quality, cli.json)
+        }
+        Top::Dataset {
+            command:
+                DatasetCommand::Export {
+                    workspace,
+                    dataset_id,
+                    profile,
+                    output: destination,
+                },
+        } => {
+            let profile = if profile == ExportProfileArg::Metadata {
+                EvaluationExportProfile::Metadata
+            } else {
+                EvaluationExportProfile::FullLocal
+            };
+            let export = open(&workspace)?.export_evaluation_dataset(
+                &EvaluationDatasetId::from_string(dataset_id)?,
+                profile,
+            )?;
+            if profile == EvaluationExportProfile::FullLocal {
+                let path = destination.ok_or_else(|| {
+                    RowvaError::validation(
+                        "full_local_output_required",
+                        "full-local export requires --output and is never printed to stdout",
+                    )
+                })?;
+                eprintln!("warning: full-local RowvAI evaluation export contains sensitive values");
+                write_sensitive_export(&path, &export)
+            } else if let Some(path) = destination {
+                fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&export).map_err(|_| {
+                        RowvaError::validation(
+                            "export_serialization_failed",
+                            "unable to serialize export",
+                        )
+                    })?,
+                )
+                .map_err(|_| {
+                    RowvaError::validation("export_write_failed", "unable to write metadata export")
+                })
+            } else {
+                output(&export, cli.json)
+            }
+        }
+        Top::Analysis {
+            command: AnalysisCommand::Run { workspace, input },
+        } => {
+            let mut app = open(&workspace)?;
+            output(&app.run_evaluation_analysis(read(&input)?)?, cli.json)
+        }
+        Top::Analysis {
+            command: AnalysisCommand::List { workspace },
+        } => output(&open(&workspace)?.list_evaluation_analyses()?, cli.json),
+        Top::Analysis {
+            command:
+                AnalysisCommand::Show {
+                    workspace,
+                    analysis_id,
+                },
+        } => output(
+            &open(&workspace)?
+                .get_evaluation_analysis(&EvaluationAnalysisRunId::from_string(analysis_id)?)?,
+            cli.json,
+        ),
         Top::Fixture {
             command: Fixture::Run { fixture },
         } => {

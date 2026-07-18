@@ -54,6 +54,18 @@ macro_rules! evaluation_id {
 evaluation_id!(EvaluationCaseId, "evc");
 evaluation_id!(EvaluationCandidateId, "evn");
 evaluation_id!(EvaluationResultId, "evr");
+evaluation_id!(EvaluationInvalidationId, "evi");
+evaluation_id!(EvaluationDatasetId, "evd");
+evaluation_id!(EvaluationAnalysisRunId, "eva");
+
+pub const EVALUATION_DATASET_PROTOCOL_VERSION: u16 = 1;
+pub const EVALUATION_QUALITY_REVISION: u16 = 1;
+pub const EVALUATION_CALIBRATION_REVISION: u16 = 1;
+pub const EVALUATION_SCORER_REVISION: u16 = 1;
+pub const EVALUATION_READINESS_REVISION: u16 = 1;
+pub const MAX_DATASET_CASES: usize = 10_000;
+pub const MAX_DATASET_NAME_BYTES: usize = 256;
+pub const MAX_DATASET_DESCRIPTION_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -303,6 +315,225 @@ pub struct EvaluationMetrics {
     pub advisory_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationInvalidationCategory {
+    IncorrectInput,
+    DuplicateCase,
+    OutcomeLeakage,
+    AmbiguousHumanReference,
+    WrongSchemaOrTarget,
+    IntegrityFailure,
+    PrivacyOrRetentionRequest,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationInvalidationInput {
+    pub protocol_version: u16,
+    pub case_id: EvaluationCaseId,
+    pub category: EvaluationInvalidationCategory,
+    pub reason: String,
+    pub actor: ActorContext,
+    pub related_case_id: Option<EvaluationCaseId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationInvalidation {
+    pub id: EvaluationInvalidationId,
+    pub case_id: EvaluationCaseId,
+    pub category: EvaluationInvalidationCategory,
+    pub reason: String,
+    pub actor: ActorContext,
+    pub previous_status: EvaluationCaseStatus,
+    pub invalidated_at: DateTime<Utc>,
+    pub case_bundle_digest: String,
+    pub related_case_id: Option<EvaluationCaseId>,
+    pub protocol_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvaluationDatasetSelectionV1 {
+    Explicit {
+        case_ids: Vec<EvaluationCaseId>,
+    },
+    AllScored {
+        created_at_or_after: Option<DateTime<Utc>>,
+        created_before: Option<DateTime<Utc>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationDatasetCreateV1 {
+    pub protocol_version: u16,
+    pub name: String,
+    pub description: Option<String>,
+    pub selection: EvaluationDatasetSelectionV1,
+    pub creator: ActorContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationDatasetCaseMemberV1 {
+    pub case_id: EvaluationCaseId,
+    pub case_bundle_digest: String,
+    pub status_at_snapshot: EvaluationCaseStatus,
+    pub case_created_at: DateTime<Utc>,
+    pub human_outcome_present: bool,
+    pub scorer_revisions: Vec<u16>,
+    pub position: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationDatasetManifestV1 {
+    pub protocol_version: u16,
+    pub dataset_id: EvaluationDatasetId,
+    pub name: String,
+    pub description: Option<String>,
+    pub workflow: EvaluationWorkflow,
+    pub workflow_version: u16,
+    pub selection: EvaluationDatasetSelectionV1,
+    pub case_members: Vec<EvaluationDatasetCaseMemberV1>,
+    pub creator: ActorContext,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationDataset {
+    pub manifest: EvaluationDatasetManifestV1,
+    pub dataset_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationAnalysisRequestV1 {
+    pub protocol_version: u16,
+    pub dataset_id: EvaluationDatasetId,
+    pub actor_id: ActorId,
+    pub actor_version: String,
+    pub scorer_revision: u16,
+    pub readiness_rubric_revision: u16,
+    pub quality_revision: u16,
+    pub calibration_revision: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationQualityWarning {
+    pub code: String,
+    pub case_ids: Vec<EvaluationCaseId>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct EvaluationQualityReportV1 {
+    pub revision: u16,
+    pub dataset_members: u64,
+    pub currently_valid_members: u64,
+    pub invalidated_after_dataset_creation: u64,
+    pub integrity_failures: u64,
+    pub missing_human_outcomes: u64,
+    pub missing_requested_scorer_results: u64,
+    pub included_members: u64,
+    pub excluded_members: u64,
+    pub no_change_count: u64,
+    pub stage_change_count: u64,
+    pub no_change_rate: Option<f64>,
+    pub stage_change_rate: Option<f64>,
+    pub destination_stage_counts: HashMap<String, u64>,
+    pub transition_counts: HashMap<String, u64>,
+    pub duplicate_content_groups: Vec<Vec<EvaluationCaseId>>,
+    pub repeated_evidence_groups: Vec<Vec<EvaluationCaseId>>,
+    pub repeated_source_meeting_groups: Vec<Vec<EvaluationCaseId>>,
+    pub repeated_target_revision_groups: Vec<Vec<EvaluationCaseId>>,
+    pub eligible_candidate_coverage: Option<f64>,
+    pub missing_candidate_cases: Vec<EvaluationCaseId>,
+    pub abstention_count: u64,
+    pub invalid_candidate_count: u64,
+    pub retry_count: u64,
+    pub confidence_present_count: u64,
+    pub confidence_missing_count: u64,
+    pub warnings: Vec<EvaluationQualityWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationBinV1 {
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub upper_inclusive: bool,
+    pub count: u64,
+    pub mean_confidence: Option<f64>,
+    pub empirical_agreement_rate: Option<f64>,
+    pub absolute_gap: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfidenceCalibrationV1 {
+    pub revision: u16,
+    pub calibrated_sample_count: u64,
+    pub brier_score: Option<f64>,
+    pub expected_calibration_error: Option<f64>,
+    pub mean_confidence: Option<f64>,
+    pub empirical_agreement_rate: Option<f64>,
+    pub missing_confidence: u64,
+    pub abstentions_excluded: u64,
+    pub invalid_excluded: u64,
+    pub retries_excluded: u64,
+    pub bins: Vec<CalibrationBinV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationAnalysisReportV1 {
+    pub protocol_version: u16,
+    pub dataset_id: EvaluationDatasetId,
+    pub dataset_digest: String,
+    pub actor_id: ActorId,
+    pub actor_version: String,
+    pub scorer_revision: u16,
+    pub readiness_rubric_revision: u16,
+    pub quality_revision: u16,
+    pub calibration_revision: u16,
+    pub included_case_ids: Vec<EvaluationCaseId>,
+    pub excluded_cases: HashMap<EvaluationCaseId, String>,
+    pub metrics: EvaluationMetrics,
+    pub quality: EvaluationQualityReportV1,
+    pub calibration: ConfidenceCalibrationV1,
+    pub advisory_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationAnalysisRun {
+    pub id: EvaluationAnalysisRunId,
+    pub analysis_input_digest: String,
+    pub report_digest: String,
+    pub created_at: DateTime<Utc>,
+    pub report: EvaluationAnalysisReportV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationExportProfile {
+    Metadata,
+    FullLocal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationDatasetExport {
+    pub payload: EvaluationDatasetExportPayload,
+    pub export_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationDatasetExportPayload {
+    pub protocol_version: u16,
+    pub profile: EvaluationExportProfile,
+    pub sensitivity: String,
+    pub contains_sensitive_values: bool,
+    pub dataset: Value,
+    pub analysis_runs: Value,
+    pub cases: Value,
+}
+
 pub fn permitted_output_schema_v1() -> Value {
     serde_json::json!({"$schema":"https://json-schema.org/draft/2020-12/schema","protocol_version":1,"decision_types":["propose_stage_update","no_change","abstain"],"proposal":{"required":["object_id","record_id","field_id","expected_revision","value"],"additional_properties":false}})
 }
@@ -337,6 +568,27 @@ pub fn sha256_digest<T: Serialize>(value: &T) -> Result<String, RowvaError> {
 }
 pub fn evaluation_bundle_digest(bundle: &EvaluationCaseBundleV1) -> Result<String, RowvaError> {
     sha256_digest(bundle)
+}
+pub fn evaluation_case_content_digest(
+    bundle: &EvaluationCaseBundleV1,
+) -> Result<String, RowvaError> {
+    sha256_digest(&serde_json::json!({
+        "content_identity_revision": 1,
+        "workflow": bundle.workflow,
+        "workflow_version": bundle.workflow_version,
+        "target_stage_field": bundle.target_stage_field,
+        "base_schema_revision": bundle.base_schema_revision,
+        "base_record_revision": bundle.base_record_revision,
+        "record_snapshot": bundle.record_snapshot,
+        "current_stage": bundle.current_stage,
+        "input": bundle.input,
+        "permitted_output_schema": bundle.permitted_output_schema,
+    }))
+}
+pub fn evaluation_dataset_digest(
+    manifest: &EvaluationDatasetManifestV1,
+) -> Result<String, RowvaError> {
+    sha256_digest(manifest)
 }
 pub fn candidate_fingerprint(input: &CandidateImport) -> Result<String, RowvaError> {
     sha256_digest(
@@ -399,6 +651,15 @@ pub fn validate_evaluation_texts(input: &DealStageQualificationInputV1) -> Resul
     Ok(())
 }
 pub fn validate_candidate_texts(input: &CandidateImport) -> Result<(), RowvaError> {
+    if input
+        .confidence
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(RowvaError::validation(
+            "invalid_confidence",
+            "confidence must be finite and between 0 and 1",
+        ));
+    }
     if let Some(v) = &input.reason {
         check_len("candidate_reason", v, MAX_REASON_BYTES)?;
     }
@@ -418,6 +679,85 @@ pub fn validate_candidate_texts(input: &CandidateImport) -> Result<(), RowvaErro
         _ => {}
     }
     Ok(())
+}
+
+pub fn validate_scorer_revision(revision: u16) -> Result<(), RowvaError> {
+    if revision == EVALUATION_SCORER_REVISION {
+        Ok(())
+    } else {
+        Err(RowvaError::validation(
+            "unsupported_evaluation_scorer_revision",
+            "unsupported evaluation scorer revision",
+        ))
+    }
+}
+pub fn validate_readiness_revision(revision: u16) -> Result<(), RowvaError> {
+    if revision == EVALUATION_READINESS_REVISION {
+        Ok(())
+    } else {
+        Err(RowvaError::validation(
+            "unsupported_evaluation_readiness_revision",
+            "unsupported evaluation readiness rubric revision",
+        ))
+    }
+}
+
+pub fn confidence_calibration(samples: &[(f64, bool)]) -> ConfidenceCalibrationV1 {
+    let mut bins = (0..10)
+        .map(|index| CalibrationBinV1 {
+            lower_bound: index as f64 / 10.0,
+            upper_bound: (index + 1) as f64 / 10.0,
+            upper_inclusive: index == 9,
+            count: 0,
+            mean_confidence: None,
+            empirical_agreement_rate: None,
+            absolute_gap: None,
+        })
+        .collect::<Vec<_>>();
+    let mut sums = [(0.0, 0u64); 10];
+    let mut brier = 0.0;
+    let mut confidence_sum = 0.0;
+    let mut correct = 0u64;
+    for (confidence, agreement) in samples {
+        let index = if *confidence == 1.0 {
+            9
+        } else {
+            (*confidence * 10.0).floor() as usize
+        };
+        bins[index].count += 1;
+        sums[index].0 += confidence;
+        sums[index].1 += u64::from(*agreement);
+        let target = if *agreement { 1.0 } else { 0.0 };
+        brier += (confidence - target).powi(2);
+        confidence_sum += confidence;
+        correct += u64::from(*agreement);
+    }
+    let count = samples.len() as u64;
+    let mut ece = 0.0;
+    for (index, bin) in bins.iter_mut().enumerate() {
+        if bin.count > 0 {
+            let mean = sums[index].0 / bin.count as f64;
+            let rate = sums[index].1 as f64 / bin.count as f64;
+            let gap = (mean - rate).abs();
+            bin.mean_confidence = Some(mean);
+            bin.empirical_agreement_rate = Some(rate);
+            bin.absolute_gap = Some(gap);
+            ece += gap * bin.count as f64 / count as f64;
+        }
+    }
+    ConfidenceCalibrationV1 {
+        revision: EVALUATION_CALIBRATION_REVISION,
+        calibrated_sample_count: count,
+        brier_score: (count > 0).then_some(brier / count as f64),
+        expected_calibration_error: (count > 0).then_some(ece),
+        mean_confidence: (count > 0).then_some(confidence_sum / count as f64),
+        empirical_agreement_rate: (count > 0).then_some(correct as f64 / count as f64),
+        missing_confidence: 0,
+        abstentions_excluded: 0,
+        invalid_excluded: 0,
+        retries_excluded: 0,
+        bins,
+    }
 }
 fn check_len(name: &str, value: &str, max: usize) -> Result<(), RowvaError> {
     if value.len() > max {
@@ -618,6 +958,34 @@ pub trait EvaluationApplication {
         candidate_id: &EvaluationCandidateId,
     ) -> Result<FrozenReplayResult, RowvaError>;
     fn evaluation_report(&self) -> Result<Vec<EvaluationMetrics>, RowvaError>;
+    fn invalidate_evaluation_case(
+        &mut self,
+        input: EvaluationInvalidationInput,
+    ) -> Result<EvaluationInvalidation, RowvaError>;
+    fn list_evaluation_cases(&self) -> Result<Vec<EvaluationCase>, RowvaError>;
+    fn create_evaluation_dataset(
+        &mut self,
+        input: EvaluationDatasetCreateV1,
+    ) -> Result<EvaluationDataset, RowvaError>;
+    fn get_evaluation_dataset(
+        &self,
+        id: &EvaluationDatasetId,
+    ) -> Result<EvaluationDataset, RowvaError>;
+    fn list_evaluation_datasets(&self) -> Result<Vec<EvaluationDataset>, RowvaError>;
+    fn run_evaluation_analysis(
+        &mut self,
+        input: EvaluationAnalysisRequestV1,
+    ) -> Result<EvaluationAnalysisRun, RowvaError>;
+    fn get_evaluation_analysis(
+        &self,
+        id: &EvaluationAnalysisRunId,
+    ) -> Result<EvaluationAnalysisRun, RowvaError>;
+    fn list_evaluation_analyses(&self) -> Result<Vec<EvaluationAnalysisRun>, RowvaError>;
+    fn export_evaluation_dataset(
+        &self,
+        id: &EvaluationDatasetId,
+        profile: EvaluationExportProfile,
+    ) -> Result<EvaluationDatasetExport, RowvaError>;
 }
 
 #[cfg(test)]
@@ -684,5 +1052,51 @@ mod tests {
     fn strict_candidate_rejects_general_or_unknown_payloads() {
         let raw = serde_json::json!({"protocol_version":1,"case_id":EvaluationCaseId::new(),"bundle_digest":"x","actor":ActorContext::local_user(),"decision":{"type":"propose_stage_update","proposal":{"object_id":ObjectId::new(),"record_id":RecordId::new(),"field_id":FieldId::new(),"expected_revision":1,"value":"Qualified","extra":true}},"reason":null,"confidence":null});
         assert!(serde_json::from_value::<CandidateImport>(raw).is_err());
+    }
+
+    #[test]
+    fn confidence_calibration_has_stable_bins_and_scores() {
+        let report = confidence_calibration(&[(1.0, true), (0.0, false), (0.9, false)]);
+        assert_eq!(report.calibrated_sample_count, 3);
+        assert_eq!(report.bins[0].count, 1);
+        assert_eq!(report.bins[9].count, 2);
+        assert!((report.brier_score.unwrap() - 0.27).abs() < 1e-12);
+        assert!(report.expected_calibration_error.is_some());
+        let empty = confidence_calibration(&[]);
+        assert_eq!(empty.brier_score, None);
+        assert_eq!(empty.expected_calibration_error, None);
+    }
+
+    #[test]
+    fn revision_dispatch_and_new_ids_are_strict() {
+        assert!(EvaluationDatasetId::from_string(EvaluationDatasetId::new().to_string()).is_ok());
+        assert!(EvaluationInvalidationId::from_string("wrong").is_err());
+        assert!(validate_scorer_revision(1).is_ok());
+        assert!(
+            matches!(validate_scorer_revision(2),Err(RowvaError::Validation{code,..}) if code=="unsupported_evaluation_scorer_revision")
+        );
+        assert!(
+            matches!(validate_readiness_revision(2),Err(RowvaError::Validation{code,..}) if code=="unsupported_evaluation_readiness_revision")
+        );
+    }
+
+    #[test]
+    fn confidence_validation_rejects_non_finite_and_out_of_range() {
+        let mut input = CandidateImport {
+            protocol_version: 1,
+            case_id: EvaluationCaseId::new(),
+            bundle_digest: "digest".into(),
+            actor: ActorContext::local_user(),
+            decision: ShadowDecision::NoChange { reason: None },
+            reason: None,
+            confidence: Some(f64::NAN),
+        };
+        assert!(validate_candidate_texts(&input).is_err());
+        input.confidence = Some(1.01);
+        assert!(validate_candidate_texts(&input).is_err());
+        input.confidence = Some(0.0);
+        assert!(validate_candidate_texts(&input).is_ok());
+        input.confidence = Some(1.0);
+        assert!(validate_candidate_texts(&input).is_ok());
     }
 }

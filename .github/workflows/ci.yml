@@ -30,6 +30,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test -p rowva-mcp --test stdio_smoke
       - run: cargo test -p rowva-eval
+      - run: cargo test -p rowva-store-sqlite immutable_dataset_analysis_and_terminal_invalidation_are_durable
       - run: cargo run -p rowva-eval -- fixture run fixtures/shadow/deal_stage_cases.json --json
       - run: npm ci
       - run: npm run build
