@@ -5,7 +5,11 @@ use rowva_core::*;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -27,6 +31,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         4,
         "approval-recovery-v1",
         include_str!("../migrations/0004_approval_recovery.sql"),
+    ),
+    (
+        5,
+        "shadow-evaluation-v1",
+        include_str!("../migrations/0005_shadow_evaluation.sql"),
     ),
 ];
 
@@ -1095,6 +1104,552 @@ impl RowvaApplication for SqliteApplication {
             records,
             next_cursor: next,
         })
+    }
+}
+
+impl EvaluationApplication for SqliteApplication {
+    fn create_evaluation_case(
+        &mut self,
+        input: EvaluationCaseCreate,
+    ) -> Result<EvaluationCase, RowvaError> {
+        if input.protocol_version != 1 {
+            return Err(RowvaError::validation(
+                "unsupported_evaluation_protocol",
+                "evaluation protocol version must be 1",
+            ));
+        }
+        if serde_json::to_vec(&input.input).map_err(internal)?.len() > 64 * 1024 {
+            return Err(RowvaError::validation(
+                "evaluation_input_too_large",
+                "meeting evidence exceeds 64 KiB",
+            ));
+        }
+        let record = self.get_record(&input.target_object_id, &input.target_record_id)?;
+        let field = self
+            .list_fields(&input.target_object_id)?
+            .into_iter()
+            .find(|f| f.id == input.target_stage_field_id)
+            .ok_or_else(|| RowvaError::not_found("field", input.target_stage_field_id.as_str()))?;
+        let current = record.values.get(&field.id).cloned().unwrap_or(Value::Null);
+        if current != input.input.current_stage {
+            return Err(RowvaError::validation(
+                "evaluation_stage_mismatch",
+                "input current_stage does not match the authoritative record",
+            ));
+        }
+        let mut snapshot = HashMap::new();
+        snapshot.insert(field.id.clone(), current.clone());
+        for id in &input.relevant_field_ids {
+            let value = record
+                .values
+                .get(id)
+                .ok_or_else(|| RowvaError::not_found("field", id.as_str()))?;
+            snapshot.insert(id.clone(), value.clone());
+        }
+        let id = EvaluationCaseId::new();
+        let now = Utc::now();
+        let schema = self.schema_revision()?;
+        let evidence_digest = hash_json(&input.input.meeting_evidence)?;
+        let bundle_value = json!({"protocol_version":1,"case_id":id,"workspace_id":self.workspace_id,"workflow":"deal_stage_qualification_v1","workflow_version":1,"object_id":input.target_object_id,"record_id":input.target_record_id,"stage_field":field,"schema_revision":schema,"record_revision":record.revision,"record_snapshot":snapshot,"input":input.input});
+        let bundle_digest = hash_json(&bundle_value)?;
+        let case = EvaluationCase {
+            id: id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            workflow: EvaluationWorkflow::DealStageQualificationV1,
+            workflow_version: 1,
+            target_object_id: input.target_object_id,
+            target_record_id: input.target_record_id,
+            target_stage_field: field,
+            base_schema_revision: schema,
+            base_record_revision: record.revision,
+            current_stage: current,
+            record_snapshot: snapshot,
+            input: input.input,
+            evidence_digest,
+            bundle_digest,
+            creator: input.creator,
+            created_at: now,
+            status: EvaluationCaseStatus::CollectingCandidates,
+            invalidated_at: None,
+            invalidation_reason: None,
+        };
+        let tx = self.conn.transaction().map_err(storage)?;
+        upsert_actor(&tx, &case.creator, &now.to_rfc3339())?;
+        tx.execute("INSERT INTO _rowva_evaluation_cases(id,workspace_id,workflow,workflow_version,target_object_id,target_record_id,target_stage_field_id,base_schema_revision,base_record_revision,current_stage_json,record_snapshot_json,input_json,target_field_json,evidence_digest,bundle_digest,creator_actor_id,creator_json,created_at,status) VALUES(?1,?2,'deal_stage_qualification_v1',1,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'collecting_candidates')",params![case.id.as_str(),case.workspace_id.as_str(),case.target_object_id.as_str(),case.target_record_id.as_str(),case.target_stage_field.id.as_str(),case.base_schema_revision.0,case.base_record_revision.0,case.current_stage.to_string(),serde_json::to_string(&case.record_snapshot).map_err(internal)?,serde_json::to_string(&case.input).map_err(internal)?,serde_json::to_string(&case.target_stage_field).map_err(internal)?,case.evidence_digest,case.bundle_digest,case.creator.id.as_str(),serde_json::to_string(&case.creator).map_err(internal)?,now.to_rfc3339()]).map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(case)
+    }
+
+    fn get_evaluation_case(&self, id: &EvaluationCaseId) -> Result<EvaluationCase, RowvaError> {
+        load_evaluation_case(&self.conn, id)
+    }
+
+    fn export_evaluation_case(
+        &self,
+        id: &EvaluationCaseId,
+    ) -> Result<EvaluationCaseExport, RowvaError> {
+        let c = self.get_evaluation_case(id)?;
+        Ok(EvaluationCaseExport {
+            protocol_version: 1,
+            case_id: c.id,
+            workflow: c.workflow,
+            workflow_version: c.workflow_version,
+            bundle_digest: c.bundle_digest,
+            target_object_id: c.target_object_id,
+            target_record_id: c.target_record_id,
+            target_stage_field: c.target_stage_field,
+            base_schema_revision: c.base_schema_revision,
+            base_record_revision: c.base_record_revision,
+            record_snapshot: c.record_snapshot,
+            current_stage: c.current_stage,
+            input: c.input,
+            permitted_output_schema: json!({"one_of":["propose_stage_update","no_change","abstain"],"only_target_stage_field":true}),
+        })
+    }
+
+    fn submit_evaluation_candidate(
+        &mut self,
+        input: CandidateImport,
+    ) -> Result<EvaluationCandidate, RowvaError> {
+        if input.protocol_version != 1 {
+            return Err(RowvaError::validation(
+                "unsupported_evaluation_protocol",
+                "candidate protocol version must be 1",
+            ));
+        }
+        if input.actor.actor_type != ActorType::Agent
+            && input.actor.actor_type != ActorType::Integration
+        {
+            return Err(RowvaError::validation(
+                "invalid_candidate_actor",
+                "candidate actor must be agent or integration",
+            ));
+        }
+        if input
+            .actor
+            .actor_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(RowvaError::validation(
+                "actor_version_required",
+                "agent candidates require actor_version",
+            ));
+        }
+        if input.confidence.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+            return Err(RowvaError::validation(
+                "invalid_confidence",
+                "confidence must be between 0 and 1",
+            ));
+        }
+        if input.reason.as_ref().is_some_and(|v| v.len() > 4096) {
+            return Err(RowvaError::validation(
+                "reason_too_long",
+                "candidate reason exceeds 4096 bytes",
+            ));
+        }
+        let case = self.get_evaluation_case(&input.case_id)?;
+        if case.bundle_digest != input.bundle_digest {
+            return Err(RowvaError::validation(
+                "bundle_digest_mismatch",
+                "candidate does not bind the sealed case bundle",
+            ));
+        }
+        if case.status != EvaluationCaseStatus::CollectingCandidates {
+            return Err(RowvaError::Conflict {
+                code: "evaluation_collection_closed".into(),
+                message: "human outcome has closed blind candidate collection".into(),
+                details: None,
+            });
+        }
+        let (status, error, changes) = match plan_frozen_candidate(&case, &input.decision) {
+            Ok(c) => (CandidateValidationStatus::Valid, None, c),
+            Err((s, e)) => (s, Some(e), vec![]),
+        };
+        let fingerprint = hash_json(
+            &json!({"protocol_version":1,"case_id":input.case_id,"bundle_digest":input.bundle_digest,"actor_id":input.actor.id,"actor_version":input.actor.actor_version,"decision":input.decision,"reason":input.reason,"confidence":input.confidence}),
+        )?;
+        let candidate = EvaluationCandidate {
+            id: EvaluationCandidateId::new(),
+            case_id: input.case_id,
+            workflow: case.workflow,
+            workflow_version: case.workflow_version,
+            bundle_digest: input.bundle_digest,
+            actor: input.actor,
+            decision: input.decision,
+            reason: input.reason,
+            confidence: input.confidence,
+            fingerprint,
+            submitted_at: Utc::now(),
+            validation_status: status,
+            validation_error: error,
+            eligible_for_metrics: true,
+            normalized_changes: changes,
+        };
+        let tx = self.conn.transaction().map_err(storage)?;
+        upsert_actor(&tx, &candidate.actor, &candidate.submitted_at.to_rfc3339())?;
+        tx.execute("INSERT INTO _rowva_evaluation_candidates(id,case_id,workflow_version,bundle_digest,actor_id,actor_json,decision_json,reason,confidence,fingerprint,submitted_at,validation_status,validation_error_json,eligible_for_metrics,normalized_changes_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14)",params![candidate.id.as_str(),candidate.case_id.as_str(),candidate.workflow_version,candidate.bundle_digest,candidate.actor.id.as_str(),serde_json::to_string(&candidate.actor).map_err(internal)?,serde_json::to_string(&candidate.decision).map_err(internal)?,candidate.reason,candidate.confidence,candidate.fingerprint,candidate.submitted_at.to_rfc3339(),validation_status(candidate.validation_status),candidate.validation_error.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,serde_json::to_string(&candidate.normalized_changes).map_err(internal)?]).map_err(constraint)?;
+        tx.commit().map_err(storage)?;
+        Ok(candidate)
+    }
+
+    fn record_evaluation_outcome(
+        &mut self,
+        id: &EvaluationCaseId,
+        input: HumanEvaluationOutcomeInput,
+    ) -> Result<Vec<EvaluationResult>, RowvaError> {
+        let case = self.get_evaluation_case(id)?;
+        if case.status != EvaluationCaseStatus::CollectingCandidates {
+            return Err(RowvaError::Conflict {
+                code: "evaluation_outcome_already_recorded".into(),
+                message: "case already has an outcome".into(),
+                details: None,
+            });
+        }
+        let human_stage = match &input {
+            HumanEvaluationOutcomeInput::NoChange { actor, reason } => {
+                if actor.actor_type != ActorType::Human {
+                    return Err(RowvaError::validation(
+                        "human_outcome_required",
+                        "no-change outcome requires a human actor",
+                    ));
+                }
+                if reason.as_ref().is_some_and(|v| v.len() > 4096) {
+                    return Err(RowvaError::validation(
+                        "reason_too_long",
+                        "outcome reason exceeds 4096 bytes",
+                    ));
+                }
+                case.current_stage.clone()
+            }
+            HumanEvaluationOutcomeInput::CommittedOperation { operation_id } => {
+                let operation = self.get_operation(operation_id)?;
+                if operation.status != OperationStatus::Committed
+                    || operation.actor.actor_type != ActorType::Human
+                {
+                    return Err(RowvaError::validation(
+                        "invalid_human_operation",
+                        "outcome must link a committed human operation",
+                    ));
+                }
+                let change = operation
+                    .changes
+                    .iter()
+                    .find(|c| {
+                        c.object_id == case.target_object_id
+                            && c.record_id.as_ref() == Some(&case.target_record_id)
+                            && c.field_id.as_ref() == Some(&case.target_stage_field.id)
+                    })
+                    .ok_or_else(|| {
+                        RowvaError::validation(
+                            "human_operation_target_mismatch",
+                            "operation does not change the evaluated stage",
+                        )
+                    })?;
+                if change.before.as_ref() != Some(&case.current_stage) {
+                    return Err(RowvaError::validation(
+                        "human_operation_base_mismatch",
+                        "human operation is incompatible with the frozen stage",
+                    ));
+                }
+                change.after.clone().unwrap_or(Value::Null)
+            }
+        };
+        let candidates = load_candidates(&self.conn, id)?;
+        let now = Utc::now();
+        let results = candidates
+            .iter()
+            .map(|c| score_candidate(c, &human_stage, &case.current_stage, now))
+            .collect::<Vec<_>>();
+        let tx = self.conn.transaction().map_err(storage)?;
+        tx.execute("INSERT INTO _rowva_evaluation_human_outcomes(case_id,outcome_json,normalized_stage_json,recorded_at) VALUES(?1,?2,?3,?4)",params![id.as_str(),serde_json::to_string(&input).map_err(internal)?,human_stage.to_string(),now.to_rfc3339()]).map_err(storage)?;
+        for r in &results {
+            tx.execute("INSERT INTO _rowva_evaluation_results(id,case_id,candidate_id,scorer_revision,candidate_stage_json,human_stage_json,verdict,eligible,scored_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![r.id.as_str(),r.case_id.as_str(),r.candidate_id.as_str(),r.scorer_revision,r.candidate_stage.as_ref().map(Value::to_string),r.human_stage.to_string(),verdict_name(r.verdict),r.eligible,r.scored_at.to_rfc3339()]).map_err(storage)?;
+        }
+        tx.execute(
+            "UPDATE _rowva_evaluation_cases SET status='scored' WHERE id=?1",
+            [id.as_str()],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(results)
+    }
+
+    fn replay_evaluation_candidate(
+        &self,
+        case_id: &EvaluationCaseId,
+        candidate_id: &EvaluationCandidateId,
+    ) -> Result<FrozenReplayResult, RowvaError> {
+        let case = self.get_evaluation_case(case_id)?;
+        let candidate = load_candidate(&self.conn, candidate_id)?;
+        if candidate.case_id != *case_id {
+            return Err(RowvaError::validation(
+                "candidate_case_mismatch",
+                "candidate belongs to another case",
+            ));
+        }
+        let (status, error, changes) = match plan_frozen_candidate(&case, &candidate.decision) {
+            Ok(c) => (CandidateValidationStatus::Valid, None, c),
+            Err((s, e)) => (s, Some(e), vec![]),
+        };
+        let deterministic_match =
+            status == candidate.validation_status && changes == candidate.normalized_changes;
+        Ok(FrozenReplayResult {
+            replay_version: 1,
+            kind: "deterministic_replay".into(),
+            case_id: case_id.clone(),
+            candidate_id: candidate_id.clone(),
+            bundle_digest: case.bundle_digest,
+            validation_status: status,
+            changes,
+            error,
+            deterministic_match,
+        })
+    }
+
+    fn evaluation_report(&self) -> Result<Vec<EvaluationMetrics>, RowvaError> {
+        let mut stmt=self.conn.prepare("SELECT c.actor_id,c.actor_json,c.case_id,r.verdict,r.eligible FROM _rowva_evaluation_results r JOIN _rowva_evaluation_candidates c ON c.id=r.candidate_id ORDER BY c.actor_id").map_err(storage)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        type Group = (ActorId, EvaluationCounts, HashSet<String>, HashSet<String>);
+        let mut grouped: HashMap<(String, String), Group> = HashMap::new();
+        for (actor_id, actor_json, case_id, verdict, eligible) in rows {
+            let actor: ActorContext = serde_json::from_str(&actor_json).map_err(internal)?;
+            let version = actor
+                .actor_version
+                .clone()
+                .unwrap_or_else(|| "unknown".into());
+            let entry = grouped.entry((actor_id, version)).or_insert((
+                actor.id,
+                EvaluationCounts::default(),
+                HashSet::new(),
+                HashSet::new(),
+            ));
+            entry.1.candidates_submitted += 1;
+            entry.1.scored_candidates += 1;
+            entry.2.insert(case_id.clone());
+            if eligible {
+                entry.3.insert(case_id);
+            }
+            match verdict.as_str() {
+                "exact_agreement" => {
+                    entry.1.exact_agreements += 1;
+                    entry.1.valid_candidates += 1
+                }
+                "no_change_agreement" => {
+                    entry.1.no_change_agreements += 1;
+                    entry.1.valid_candidates += 1
+                }
+                "false_positive" => {
+                    entry.1.false_positives += 1;
+                    entry.1.valid_candidates += 1
+                }
+                "false_negative" => {
+                    entry.1.false_negatives += 1;
+                    entry.1.valid_candidates += 1
+                }
+                "wrong_stage" => {
+                    entry.1.wrong_stage += 1;
+                    entry.1.valid_candidates += 1
+                }
+                "abstained" => {
+                    entry.1.abstentions += 1;
+                    entry.1.valid_candidates += 1
+                }
+                _ => entry.1.invalid_candidates += 1,
+            }
+        }
+        Ok(grouped
+            .into_iter()
+            .map(
+                |((_id, version), (actor_id, mut c, cases, eligible_cases))| {
+                    c.total_cases = cases.len() as u64;
+                    c.eligible_cases = eligible_cases.len() as u64;
+                    let scored = c.scored_candidates.max(1) as f64;
+                    let submitted = c.candidates_submitted.max(1) as f64;
+                    let (class, reasons) = readiness(&c);
+                    EvaluationMetrics {
+                        workflow: EvaluationWorkflow::DealStageQualificationV1,
+                        actor_id,
+                        actor_version: version,
+                        exact_agreement_rate: (c.exact_agreements + c.no_change_agreements) as f64
+                            / scored,
+                        coverage_rate: (c.scored_candidates - c.abstentions) as f64 / scored,
+                        invalid_proposal_rate: c.invalid_candidates as f64 / submitted,
+                        counts: c,
+                        readiness_rubric_revision: 1,
+                        readiness: class,
+                        readiness_reasons: reasons,
+                        advisory_only: true,
+                    }
+                },
+            )
+            .collect())
+    }
+}
+
+fn hash_json(value: &Value) -> Result<String, RowvaError> {
+    let bytes = serde_json::to_vec(&canonical_json(value)).map_err(internal)?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+fn load_evaluation_case(
+    conn: &Connection,
+    id: &EvaluationCaseId,
+) -> Result<EvaluationCase, RowvaError> {
+    type R = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+    let r:R=conn.query_row("SELECT workspace_id,target_object_id,target_record_id,target_stage_field_id,workflow,base_schema_revision,base_record_revision,current_stage_json,record_snapshot_json,input_json,target_field_json,evidence_digest,bundle_digest,creator_json,created_at,status,invalidated_at,invalidation_reason FROM _rowva_evaluation_cases WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?))).optional().map_err(storage)?.ok_or_else(||RowvaError::not_found("evaluation_case",id.as_str()))?;
+    Ok(EvaluationCase {
+        id: id.clone(),
+        workspace_id: WorkspaceId::from_string(r.0)?,
+        workflow: EvaluationWorkflow::DealStageQualificationV1,
+        workflow_version: 1,
+        target_object_id: ObjectId::from_string(r.1)?,
+        target_record_id: RecordId::from_string(r.2)?,
+        target_stage_field: serde_json::from_str(&r.10).map_err(internal)?,
+        base_schema_revision: SchemaRevision(r.5),
+        base_record_revision: RecordRevision(r.6),
+        current_stage: serde_json::from_str(&r.7).map_err(internal)?,
+        record_snapshot: serde_json::from_str(&r.8).map_err(internal)?,
+        input: serde_json::from_str(&r.9).map_err(internal)?,
+        evidence_digest: r.11,
+        bundle_digest: r.12,
+        creator: serde_json::from_str(&r.13).map_err(internal)?,
+        created_at: parse_time(r.14),
+        status: match r.15.as_str() {
+            "outcome_recorded" => EvaluationCaseStatus::OutcomeRecorded,
+            "scored" => EvaluationCaseStatus::Scored,
+            "invalidated" => EvaluationCaseStatus::Invalidated,
+            _ => EvaluationCaseStatus::CollectingCandidates,
+        },
+        invalidated_at: r.16.map(parse_time),
+        invalidation_reason: r.17,
+    })
+}
+fn load_candidates(
+    conn: &Connection,
+    id: &EvaluationCaseId,
+) -> Result<Vec<EvaluationCandidate>, RowvaError> {
+    let mut s = conn
+        .prepare(
+            "SELECT id FROM _rowva_evaluation_candidates WHERE case_id=?1 ORDER BY submitted_at,id",
+        )
+        .map_err(storage)?;
+    let ids = s
+        .query_map([id.as_str()], |r| r.get::<_, String>(0))
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    ids.into_iter()
+        .map(|v| load_candidate(conn, &EvaluationCandidateId::from_string(v)?))
+        .collect()
+}
+fn load_candidate(
+    conn: &Connection,
+    id: &EvaluationCandidateId,
+) -> Result<EvaluationCandidate, RowvaError> {
+    type R = (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<f64>,
+        String,
+        String,
+        String,
+        Option<String>,
+        bool,
+        String,
+    );
+    let r:R=conn.query_row("SELECT case_id,workflow_version,bundle_digest,actor_json,decision_json,reason,confidence,fingerprint,submitted_at,validation_status,validation_error_json,eligible_for_metrics,normalized_changes_json FROM _rowva_evaluation_candidates WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?))).optional().map_err(storage)?.ok_or_else(||RowvaError::not_found("evaluation_candidate",id.as_str()))?;
+    Ok(EvaluationCandidate {
+        id: id.clone(),
+        case_id: EvaluationCaseId::from_string(r.0)?,
+        workflow: EvaluationWorkflow::DealStageQualificationV1,
+        workflow_version: r.1 as u16,
+        bundle_digest: r.2,
+        actor: serde_json::from_str(&r.3).map_err(internal)?,
+        decision: serde_json::from_str(&r.4).map_err(internal)?,
+        reason: r.5,
+        confidence: r.6,
+        fingerprint: r.7,
+        submitted_at: parse_time(r.8),
+        validation_status: parse_validation_status(&r.9),
+        validation_error: r
+            .10
+            .map(|v| serde_json::from_str(&v).map_err(internal))
+            .transpose()?,
+        eligible_for_metrics: r.11,
+        normalized_changes: serde_json::from_str(&r.12).map_err(internal)?,
+    })
+}
+fn validation_status(v: CandidateValidationStatus) -> &'static str {
+    match v {
+        CandidateValidationStatus::Valid => "valid",
+        CandidateValidationStatus::InvalidTarget => "invalid_target",
+        CandidateValidationStatus::StaleRevision => "stale_revision",
+        CandidateValidationStatus::InvalidValue => "invalid_value",
+        CandidateValidationStatus::UnsafeExtraChanges => "unsafe_extra_changes",
+        CandidateValidationStatus::Invalid => "invalid",
+    }
+}
+fn parse_validation_status(v: &str) -> CandidateValidationStatus {
+    match v {
+        "valid" => CandidateValidationStatus::Valid,
+        "invalid_target" => CandidateValidationStatus::InvalidTarget,
+        "stale_revision" => CandidateValidationStatus::StaleRevision,
+        "invalid_value" => CandidateValidationStatus::InvalidValue,
+        "unsafe_extra_changes" => CandidateValidationStatus::UnsafeExtraChanges,
+        _ => CandidateValidationStatus::Invalid,
+    }
+}
+fn verdict_name(v: EvaluationVerdict) -> &'static str {
+    match v {
+        EvaluationVerdict::ExactAgreement => "exact_agreement",
+        EvaluationVerdict::NoChangeAgreement => "no_change_agreement",
+        EvaluationVerdict::FalsePositive => "false_positive",
+        EvaluationVerdict::FalseNegative => "false_negative",
+        EvaluationVerdict::WrongStage => "wrong_stage",
+        EvaluationVerdict::Abstained => "abstained",
+        EvaluationVerdict::InvalidTarget => "invalid_target",
+        EvaluationVerdict::StaleRevision => "stale_revision",
+        EvaluationVerdict::InvalidValue => "invalid_value",
+        EvaluationVerdict::UnsafeExtraChanges => "unsafe_extra_changes",
+        EvaluationVerdict::InvalidCandidate => "invalid_candidate",
     }
 }
 

@@ -1,6 +1,6 @@
-# Rowva MCP stdio server
+# RowvAI MCP stdio server
 
-`rowva-mcp` exposes one local Rowva workspace as a governed MCP tool server. It supports discovery, bounded reads, durable mutation previews, exact preview commits, and operation inspection. Agent record mutations require human approval by default. It does not expose SQLite, filesystem paths, schema mutation, delete, approval actions, undo, HTTP, prompts, resources, or an agent runtime.
+`rowva-mcp` exposes one local RowvAI workspace as a governed MCP tool server. It supports discovery, bounded reads, durable mutation previews, exact preview commits, and operation inspection. Agent record mutations require human approval by default. It does not expose SQLite, filesystem paths, schema mutation, delete, approval actions, undo, HTTP, prompts, resources, or an agent runtime.
 
 ## Build and start
 

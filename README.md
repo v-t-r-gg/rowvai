@@ -1,6 +1,8 @@
-# Rowva
+# RowvAI
 
-Rowva is an early local-first, model-neutral CRM runtime for humans and autonomous agents. It stores portable workspaces in SQLite and exposes stable semantic operations with actor attribution, previews, revisions, idempotency, structured errors, and an append-only audit trail. The desktop grid is a thin human control plane, not the product boundary.
+RowvAI is the public product name. Existing `rowva` internal namespaces and protocol identifiers are retained for compatibility.
+
+RowvAI is an early local-first, model-neutral CRM runtime for humans and autonomous agents. It stores portable workspaces in SQLite and exposes stable semantic operations with actor attribution, previews, revisions, idempotency, structured errors, and an append-only audit trail. The desktop grid is a thin human control plane, not the product boundary.
 
 ## Current foundation
 
@@ -14,8 +16,9 @@ Rowva is an early local-first, model-neutral CRM runtime for humans and autonomo
 - committed-mutation idempotency
 - thin Tauri compatibility commands and React grid
 - official-SDK MCP stdio server with bounded reads, durable previews, exact commits, receipts, and history
+- developer `rowva-eval` CLI with frozen deal-stage shadow cases, strict candidate import, deterministic replay, scoring, and advisory actor-version reports
 
-The desktop now includes an Agent Activity inbox for durable approve/reject/revise decisions and conflict-safe undo of record updates. See [approvals](docs/approvals.md), [undo](docs/undo.md), [MCP usage](docs/mcp.md), [architecture](docs/architecture.md), and the [threat model](docs/security/mcp-threat-model.md).
+The desktop includes an Agent Activity inbox for governed changes. Shadow evaluation remains developer-facing and cannot alter authority. See [shadow evaluation](docs/shadow-evaluation.md), [approvals](docs/approvals.md), [undo](docs/undo.md), [MCP usage](docs/mcp.md), [architecture](docs/architecture.md), and the [threat model](docs/security/mcp-threat-model.md).
 
 ## Development
 

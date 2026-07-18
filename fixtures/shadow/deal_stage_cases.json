@@ -1,0 +1,16 @@
+{
+  "fixture_version": 1,
+  "synthetic": true,
+  "cases": [
+    {"name":"matching_change","human":"Qualified","agent":"Qualified"},
+    {"name":"matching_no_change","human":"Discovery","agent":"no_change"},
+    {"name":"false_negative","human":"Qualified","agent":"no_change"},
+    {"name":"false_positive","human":"Discovery","agent":"Qualified"},
+    {"name":"wrong_stage","human":"Qualified","agent":"Negotiation"},
+    {"name":"abstain","human":"Discovery","agent":"abstain"},
+    {"name":"wrong_record","human":"Discovery","agent":"invalid_target"},
+    {"name":"extra_field","human":"Discovery","agent":"unsafe_extra_changes"},
+    {"name":"stale_revision","human":"Discovery","agent":"stale_revision"},
+    {"name":"two_versions","human":"Qualified","agents":{"meeting-agent@1.0":"no_change","meeting-agent@2.0":"Qualified"}}
+  ]
+}

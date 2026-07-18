@@ -82,7 +82,7 @@ const handleAddRow = async () => {
       {/* Header - matches your screenshot */}
       <div className="border-b border-zinc-800 p-6">
         <div className="max-w-6xl mx-auto">
-          <h1 className="text-5xl font-bold tracking-tighter">Rowva</h1>
+          <h1 className="text-5xl font-bold tracking-tighter">RowvAI</h1>
           <p className="text-zinc-400 mt-1">Local-first Relational Spreadsheet CRM</p>
         </div>
       </div>

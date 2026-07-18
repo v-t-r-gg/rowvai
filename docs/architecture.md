@@ -1,4 +1,4 @@
-# Rowva architecture
+# RowvAI architecture
 
 ## Baseline before this transition
 
@@ -7,7 +7,7 @@ The 0.1 prototype was one Tauri crate plus React. Tauri commands opened SQLite c
 ## Current boundaries
 
 ```text
-React grid / future CLI / rowva-mcp stdio
+React grid / rowva-eval CLI / rowva-mcp stdio
                   |
           transport adapters
                   |
@@ -25,6 +25,8 @@ React grid / future CLI / rowva-mcp stdio
 `src-tauri` is a compatibility adapter. Commands deserialize old table/column/row-shaped UI calls, establish the `act_local_user` human actor, invoke the application service, and serialize results. No parallel business implementation remains. The grid now receives field-ID-keyed records.
 
 `rowva-mcp` binds one canonical workspace and immutable process actor. Eight strict handlers translate MCP input into the same `RowvaApplication`; the official `rmcp` SDK owns JSON-RPC and stdio framing. It issues no SQL and logs only to stderr.
+
+`rowva-eval` is a developer adapter over the transport-neutral `EvaluationApplication`. Migration 5 stores immutable minimal cases, independent candidates, explicit human outcomes, and versioned results. Evaluation is intentionally disconnected from operation commit, approval, policy, and capability code. Frozen replay uses captured schema/record evidence rather than authoritative live state.
 
 ## Storage and migrations
 
