@@ -874,8 +874,157 @@ fn replay_rejects_corrupted_candidate_fingerprint() {
         )
         .unwrap();
     assert!(
-        matches!(app.replay_evaluation_candidate(&case.id,&candidate.id),Err(RowvaError::Validation{code,..}) if code=="evaluation_candidate_fingerprint_mismatch")
+        matches!(app.replay_evaluation_candidate(&case.id,&candidate.id),Err(RowvaError::Validation{code,..}) if code=="evaluation_candidate_integrity_mismatch")
     );
+}
+
+fn no_change_candidate(case: &EvaluationCase, version: &str) -> CandidateImport {
+    CandidateImport {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        bundle_digest: case.bundle_digest.clone(),
+        actor: eval_agent(version),
+        decision: ShadowDecision::NoChange { reason: None },
+        reason: None,
+        confidence: None,
+    }
+}
+
+#[test]
+fn candidate_commit_before_outcome_is_included_in_atomic_scoring() {
+    let (_dir, path, mut setup_app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut setup_app);
+    let case = eval_case(&mut setup_app, &object, &stage, &record);
+    drop(setup_app);
+
+    let acquired = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut candidate_app = SqliteApplication::open(&path).unwrap();
+    let acquired_hook = acquired.clone();
+    let release_hook = release.clone();
+    candidate_app.set_evaluation_tx_hook(std::sync::Arc::new(move || {
+        acquired_hook.wait();
+        release_hook.wait();
+    }));
+    let candidate_input = no_change_candidate(&case, "candidate-wins");
+    let candidate_thread =
+        std::thread::spawn(move || candidate_app.submit_evaluation_candidate(candidate_input));
+    acquired.wait();
+    let mut outcome_app = SqliteApplication::open(&path).unwrap();
+    let case_id = case.id.clone();
+    let outcome_thread = std::thread::spawn(move || {
+        outcome_app.record_evaluation_outcome(
+            &case_id,
+            HumanEvaluationOutcomeInput::NoChange {
+                actor: ActorContext::local_user(),
+                reason: None,
+            },
+        )
+    });
+    release.wait();
+    let candidate = candidate_thread.join().unwrap().unwrap();
+    let results = outcome_thread.join().unwrap().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].candidate_id, candidate.id);
+    let report = SqliteApplication::open(&path)
+        .unwrap()
+        .evaluation_report()
+        .unwrap();
+    assert_eq!(report[0].counts.scored_eligible, 1);
+    assert_eq!(report[0].counts.pending_unscored_eligible, 0);
+}
+
+#[test]
+fn outcome_commit_before_candidate_closes_collection_atomically() {
+    let (_dir, path, mut setup_app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut setup_app);
+    let case = eval_case(&mut setup_app, &object, &stage, &record);
+    drop(setup_app);
+
+    let acquired = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut outcome_app = SqliteApplication::open(&path).unwrap();
+    let acquired_hook = acquired.clone();
+    let release_hook = release.clone();
+    outcome_app.set_evaluation_tx_hook(std::sync::Arc::new(move || {
+        acquired_hook.wait();
+        release_hook.wait();
+    }));
+    let case_id = case.id.clone();
+    let outcome_thread = std::thread::spawn(move || {
+        outcome_app.record_evaluation_outcome(
+            &case_id,
+            HumanEvaluationOutcomeInput::NoChange {
+                actor: ActorContext::local_user(),
+                reason: None,
+            },
+        )
+    });
+    acquired.wait();
+    let mut candidate_app = SqliteApplication::open(&path).unwrap();
+    let candidate_input = no_change_candidate(&case, "outcome-wins");
+    let candidate_thread =
+        std::thread::spawn(move || candidate_app.submit_evaluation_candidate(candidate_input));
+    release.wait();
+    assert!(outcome_thread.join().unwrap().unwrap().is_empty());
+    assert!(
+        matches!(candidate_thread.join().unwrap(),Err(RowvaError::Conflict{code,..}) if code=="evaluation_collection_closed")
+    );
+    let evidence = SqliteApplication::open(&path).unwrap();
+    let candidates: i64 = evidence
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_candidates WHERE case_id=?1",
+            [case.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(candidates, 0);
+}
+
+#[test]
+fn corrupted_candidate_rolls_back_outcome_and_results() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let candidate = app
+        .submit_evaluation_candidate(no_change_candidate(&case, "corrupted"))
+        .unwrap();
+    app.conn
+        .execute(
+            "UPDATE _rowva_evaluation_candidates SET actor_version='tampered' WHERE id=?1",
+            [candidate.id.as_str()],
+        )
+        .unwrap();
+    assert!(
+        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::NoChange{actor:ActorContext::local_user(),reason:None}),Err(RowvaError::Validation{code,..}) if code=="evaluation_candidate_integrity_mismatch")
+    );
+    let status: String = app
+        .conn
+        .query_row(
+            "SELECT status FROM _rowva_evaluation_cases WHERE id=?1",
+            [case.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let outcomes: i64 = app
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_human_outcomes WHERE case_id=?1",
+            [case.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let results: i64 = app
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_results WHERE case_id=?1",
+            [case.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "collecting_candidates");
+    assert_eq!((outcomes, results), (0, 0));
 }
 
 #[test]

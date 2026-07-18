@@ -150,6 +150,16 @@ struct FixtureScenarioResult {
     actual_verdicts: Vec<EvaluationVerdict>,
     replay_deterministic: bool,
     mutation_safe: bool,
+    candidate_created_no_operation: bool,
+    candidate_created_no_approval: bool,
+    candidate_preserved_record_revision: bool,
+    candidate_preserved_schema_revision: bool,
+    human_operation_delta_correct: bool,
+    replay_created_no_operation: bool,
+    replay_created_no_approval: bool,
+    replay_preserved_evaluation_evidence: bool,
+    replay_preserved_record_revision: bool,
+    replay_preserved_schema_revision: bool,
     versions_separate: bool,
 }
 
@@ -344,9 +354,13 @@ fn run_fixture_file(file: FixtureFile) -> Result<FixtureSummary, RowvaError> {
             expected.push(spec.expected_verdict);
             submitted.push(candidate);
         }
-        let mutation_safe_before = app.get_record(&object, &record)? == before
-            && app.list_operations(100)?.len() == operations
-            && app.list_approvals(100)?.len() == approvals;
+        let candidate_record = app.get_record(&object, &record)?;
+        let candidate_created_no_operation = app.list_operations(100)?.len() == operations;
+        let candidate_created_no_approval = app.list_approvals(100)?.len() == approvals;
+        let candidate_preserved_record_revision = candidate_record.revision == before.revision;
+        let candidate_preserved_schema_revision =
+            app.schema_revision()? == case.base_schema_revision;
+        let human_changes_stage = scenario.human != "Discovery";
         let outcome = if scenario.human == "Discovery" {
             HumanEvaluationOutcomeInput::NoChange {
                 actor: ActorContext::local_user(),
@@ -370,17 +384,42 @@ fn run_fixture_file(file: FixtureFile) -> Result<FixtureSummary, RowvaError> {
         };
         let results = app.record_evaluation_outcome(&case.id, outcome)?;
         let actual = results.iter().map(|r| r.verdict).collect::<Vec<_>>();
+        let expected_human_operation_delta = usize::from(human_changes_stage);
+        let human_operation_delta_correct =
+            app.list_operations(100)?.len() == operations + expected_human_operation_delta;
+        let replay_operations = app.list_operations(100)?.len();
+        let replay_approvals = app.list_approvals(100)?.len();
+        let replay_record_revision = app.get_record(&object, &record)?.revision;
+        let replay_schema_revision = app.schema_revision()?;
+        let replay_report = app.evaluation_report()?;
+        let replay_case = app.get_evaluation_case(&case.id)?;
         let replays = submitted
             .iter()
             .map(|c| app.replay_evaluation_candidate(&case.id, &c.id))
             .collect::<Result<Vec<_>, _>>()?;
         let replay_deterministic = replays.iter().all(|r| r.deterministic_match);
+        let replay_created_no_operation = app.list_operations(100)?.len() == replay_operations;
+        let replay_created_no_approval = app.list_approvals(100)?.len() == replay_approvals;
+        let replay_preserved_record_revision =
+            app.get_record(&object, &record)?.revision == replay_record_revision;
+        let replay_preserved_schema_revision = app.schema_revision()? == replay_schema_revision;
+        let replay_preserved_evaluation_evidence = app.evaluation_report()? == replay_report
+            && app.get_evaluation_case(&case.id)? == replay_case;
         let expected_live = if scenario.human == "Discovery" {
             json!("Discovery")
         } else {
             json!(scenario.human)
         };
-        let mutation_safe = mutation_safe_before
+        let mutation_safe = candidate_created_no_operation
+            && candidate_created_no_approval
+            && candidate_preserved_record_revision
+            && candidate_preserved_schema_revision
+            && human_operation_delta_correct
+            && replay_created_no_operation
+            && replay_created_no_approval
+            && replay_preserved_evaluation_evidence
+            && replay_preserved_record_revision
+            && replay_preserved_schema_revision
             && app.get_record(&object, &record)?.values.get(&stage) == Some(&expected_live);
         let versions_separate = if submitted.len() > 1 {
             let report = app.evaluation_report()?;
@@ -400,6 +439,16 @@ fn run_fixture_file(file: FixtureFile) -> Result<FixtureSummary, RowvaError> {
             actual_verdicts: actual,
             replay_deterministic,
             mutation_safe,
+            candidate_created_no_operation,
+            candidate_created_no_approval,
+            candidate_preserved_record_revision,
+            candidate_preserved_schema_revision,
+            human_operation_delta_correct,
+            replay_created_no_operation,
+            replay_created_no_approval,
+            replay_preserved_evaluation_evidence,
+            replay_preserved_record_revision,
+            replay_preserved_schema_revision,
             versions_separate,
         });
     }
