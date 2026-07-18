@@ -342,10 +342,14 @@ pub fn plan_frozen_candidate(
 }
 
 pub fn field_value_is_valid(field: &FieldDefinition, value: &Value) -> bool {
+    field_kind_value_is_valid(&field.kind, field.required, value)
+}
+
+pub fn field_kind_value_is_valid(kind: &FieldKind, required: bool, value: &Value) -> bool {
     if value.is_null() {
-        return !field.required;
+        return !required;
     }
-    match &field.kind {
+    match kind {
         FieldKind::Text(_) | FieldKind::Date | FieldKind::DateTime => value.is_string(),
         FieldKind::Number(_) => value.is_number(),
         FieldKind::Boolean => value.is_boolean(),

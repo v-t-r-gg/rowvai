@@ -1971,18 +1971,26 @@ fn validate_fields(
     object: &ObjectId,
     values: &HashMap<FieldId, Value>,
 ) -> Result<(), RowvaError> {
-    for f in values.keys() {
-        let ok: bool = tx
+    for (f, value) in values {
+        let definition: Option<(String, bool)> = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM _rowva_fields WHERE id=?1 AND object_id=?2)",
+                "SELECT kind_json,required FROM _rowva_fields WHERE id=?1 AND object_id=?2",
                 params![f.as_str(), object.as_str()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
+            .optional()
             .map_err(storage)?;
-        if !ok {
+        let Some((kind, required)) = definition else {
             return Err(RowvaError::validation(
                 "unknown_field",
                 format!("field '{}' does not belong to object", f),
+            ));
+        };
+        let kind: FieldKind = serde_json::from_str(&kind).map_err(internal)?;
+        if !field_kind_value_is_valid(&kind, required, value) {
+            return Err(RowvaError::validation(
+                "invalid_field_value",
+                format!("value is incompatible with field '{}'", f),
             ));
         }
     }
