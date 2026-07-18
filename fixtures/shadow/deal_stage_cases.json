@@ -2,15 +2,15 @@
   "fixture_version": 1,
   "synthetic": true,
   "cases": [
-    {"name":"matching_change","human":"Qualified","agent":"Qualified"},
-    {"name":"matching_no_change","human":"Discovery","agent":"no_change"},
-    {"name":"false_negative","human":"Qualified","agent":"no_change"},
-    {"name":"false_positive","human":"Discovery","agent":"Qualified"},
-    {"name":"wrong_stage","human":"Qualified","agent":"Negotiation"},
-    {"name":"abstain","human":"Discovery","agent":"abstain"},
-    {"name":"wrong_record","human":"Discovery","agent":"invalid_target"},
-    {"name":"extra_field","human":"Discovery","agent":"unsafe_extra_changes"},
-    {"name":"stale_revision","human":"Discovery","agent":"stale_revision"},
-    {"name":"two_versions","human":"Qualified","agents":{"meeting-agent@1.0":"no_change","meeting-agent@2.0":"Qualified"}}
+    {"name":"matching_change","human":"Qualified","candidates":[{"actor_version":"1.0","decision":"stage_update","value":"Qualified","expected_verdict":"exact_agreement","expected_validation":"valid","expected_eligible":true}]},
+    {"name":"matching_no_change","human":"Discovery","candidates":[{"actor_version":"1.0","decision":"no_change","expected_verdict":"no_change_agreement","expected_validation":"valid","expected_eligible":true}]},
+    {"name":"false_negative","human":"Qualified","candidates":[{"actor_version":"1.0","decision":"no_change","expected_verdict":"false_negative","expected_validation":"valid","expected_eligible":true}]},
+    {"name":"false_positive","human":"Discovery","candidates":[{"actor_version":"1.0","decision":"stage_update","value":"Qualified","expected_verdict":"false_positive","expected_validation":"valid","expected_eligible":true}]},
+    {"name":"wrong_stage","human":"Qualified","candidates":[{"actor_version":"1.0","decision":"stage_update","value":"Negotiation","expected_verdict":"wrong_stage","expected_validation":"valid","expected_eligible":true}]},
+    {"name":"abstain","human":"Discovery","candidates":[{"actor_version":"1.0","decision":"abstain","expected_verdict":"abstained","expected_validation":"valid","expected_eligible":true}]},
+    {"name":"wrong_record","human":"Discovery","candidates":[{"actor_version":"1.0","decision":"stage_update","value":"Qualified","target":"wrong_record","expected_verdict":"invalid_target","expected_validation":"invalid_target","expected_eligible":true}]},
+    {"name":"malformed_field","human":"Discovery","candidates":[{"actor_version":"1.0","decision":"stage_update","value":"Qualified","target":"wrong_field","expected_verdict":"unsafe_extra_changes","expected_validation":"unsafe_extra_changes","expected_eligible":true}]},
+    {"name":"stale_revision","human":"Discovery","candidates":[{"actor_version":"1.0","decision":"stage_update","value":"Qualified","revision_offset":1,"expected_verdict":"stale_revision","expected_validation":"stale_revision","expected_eligible":true}]},
+    {"name":"two_versions","human":"Qualified","candidates":[{"actor_version":"1.0","decision":"no_change","expected_verdict":"false_negative","expected_validation":"valid","expected_eligible":true},{"actor_version":"2.0","decision":"stage_update","value":"Qualified","expected_verdict":"exact_agreement","expected_validation":"valid","expected_eligible":true}]}
   ]
 }

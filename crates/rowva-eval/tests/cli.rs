@@ -14,9 +14,17 @@ fn fixture_runs_offline_and_invalid_input_fails() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8(out.stdout)
+    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["scenario_count"], 10);
+    assert_eq!(summary["passed"], 10);
+    assert_eq!(summary["failed"], 0);
+    assert!(summary["scenarios"]
+        .as_array()
         .unwrap()
-        .contains("\"cases\":10"));
+        .iter()
+        .all(|scenario| scenario["passed"] == true
+            && scenario["replay_deterministic"] == true
+            && scenario["mutation_safe"] == true));
     let missing_dir = tempfile::tempdir().unwrap();
     let missing_workspace = missing_dir.path().join("missing.rowva");
     let out = ProcessCommand::new(bin)

@@ -578,8 +578,6 @@ fn shadow_candidates_are_frozen_non_mutating_and_replayable() {
     let schema = app.schema_revision().unwrap();
     let operations = app.list_operations(100).unwrap().len();
     let approvals = app.list_approvals(100).unwrap().len();
-    let mut values = HashMap::new();
-    values.insert(stage.clone(), json!("Qualified"));
     let candidate = app
         .submit_evaluation_candidate(CandidateImport {
             protocol_version: 1,
@@ -587,11 +585,12 @@ fn shadow_candidates_are_frozen_non_mutating_and_replayable() {
             bundle_digest: case.bundle_digest.clone(),
             actor: eval_agent("1.0"),
             decision: ShadowDecision::ProposeStageUpdate {
-                command: Command::UpdateRecord {
+                proposal: StageUpdateProposalV1 {
                     object_id: object.clone(),
                     record_id: record.clone(),
-                    values,
-                    expected_revision: Some(case.base_record_revision),
+                    field_id: stage.clone(),
+                    value: json!("Qualified"),
+                    expected_revision: case.base_record_revision,
                 },
             },
             reason: Some("Synthetic meeting evidence satisfies qualification".into()),
@@ -655,9 +654,6 @@ fn human_operation_outcome_and_invalid_candidate_are_scored() {
     let (_dir, _path, mut app) = setup();
     let (object, stage, record) = evaluation_setup(&mut app);
     let case = eval_case(&mut app, &object, &stage, &record);
-    let mut unsafe_values = HashMap::new();
-    unsafe_values.insert(stage.clone(), json!("Qualified"));
-    unsafe_values.insert(FieldId::new(), json!("bad"));
     let invalid = app
         .submit_evaluation_candidate(CandidateImport {
             protocol_version: 1,
@@ -665,11 +661,12 @@ fn human_operation_outcome_and_invalid_candidate_are_scored() {
             bundle_digest: case.bundle_digest.clone(),
             actor: eval_agent("1.0"),
             decision: ShadowDecision::ProposeStageUpdate {
-                command: Command::UpdateRecord {
+                proposal: StageUpdateProposalV1 {
                     object_id: object.clone(),
                     record_id: record.clone(),
-                    values: unsafe_values,
-                    expected_revision: Some(RecordRevision(1)),
+                    field_id: FieldId::new(),
+                    value: json!("bad"),
+                    expected_revision: RecordRevision(1),
                 },
             },
             reason: None,
@@ -702,6 +699,296 @@ fn human_operation_outcome_and_invalid_candidate_are_scored() {
     assert_eq!(results[0].verdict, EvaluationVerdict::UnsafeExtraChanges);
     let report = app.evaluation_report().unwrap();
     assert_eq!(report[0].actor_version, "1.0");
-    assert_eq!(report[0].counts.invalid_candidates, 1);
+    assert_eq!(report[0].counts.invalid_scored, 1);
     assert!(report[0].advisory_only);
+}
+
+#[test]
+fn exported_bundle_is_exactly_digestible_and_corruption_is_detected() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let export = app.export_evaluation_case(&case.id).unwrap();
+    assert_eq!(
+        evaluation_bundle_digest(&export.bundle).unwrap(),
+        export.bundle_digest
+    );
+    let mut evidence = export.bundle.clone();
+    evidence.input.meeting_evidence["budget_confirmed"] = json!(false);
+    assert_ne!(
+        evaluation_bundle_digest(&evidence).unwrap(),
+        export.bundle_digest
+    );
+    let mut field = export.bundle.clone();
+    field.target_stage_field.required = false;
+    assert_ne!(
+        evaluation_bundle_digest(&field).unwrap(),
+        export.bundle_digest
+    );
+    let mut schema = export.bundle.clone();
+    schema.permitted_output_schema["proposal"]["additional_properties"] = json!(true);
+    assert_ne!(
+        evaluation_bundle_digest(&schema).unwrap(),
+        export.bundle_digest
+    );
+    app.conn
+        .execute(
+            "UPDATE _rowva_evaluation_cases SET record_snapshot_json='{}' WHERE id=?1",
+            [case.id.as_str()],
+        )
+        .unwrap();
+    assert!(
+        matches!(app.export_evaluation_case(&case.id),Err(RowvaError::Validation{code,..}) if code=="evaluation_bundle_integrity_mismatch")
+    );
+}
+
+#[test]
+fn retries_are_preserved_but_only_first_attempt_is_eligible() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let candidate = |version: &str, value: &str| CandidateImport {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        bundle_digest: case.bundle_digest.clone(),
+        actor: eval_agent(version),
+        decision: ShadowDecision::ProposeStageUpdate {
+            proposal: StageUpdateProposalV1 {
+                object_id: object.clone(),
+                record_id: record.clone(),
+                field_id: stage.clone(),
+                expected_revision: RecordRevision(1),
+                value: json!(value),
+            },
+        },
+        reason: None,
+        confidence: None,
+    };
+    let first = app
+        .submit_evaluation_candidate(candidate("1.0", "Qualified"))
+        .unwrap();
+    let retry = app
+        .submit_evaluation_candidate(candidate("1.0", "Negotiation"))
+        .unwrap();
+    let other = app
+        .submit_evaluation_candidate(candidate("2.0", "Qualified"))
+        .unwrap();
+    assert!(first.eligible_for_metrics);
+    assert!(!retry.eligible_for_metrics);
+    assert_eq!(retry.attempt_number, 2);
+    assert!(other.eligible_for_metrics);
+    app.record_evaluation_outcome(
+        &case.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: None,
+        },
+    )
+    .unwrap();
+    let report = app.evaluation_report().unwrap();
+    assert_eq!(report.len(), 2);
+    let v1 = report.iter().find(|r| r.actor_version == "1.0").unwrap();
+    assert_eq!(v1.counts.total_submitted_attempts, 2);
+    assert_eq!(v1.counts.eligible_decisions, 1);
+    assert_eq!(v1.counts.ineligible_retries, 1);
+    assert_eq!(v1.counts.scored_eligible, 1);
+}
+
+#[test]
+fn deleting_live_record_does_not_delete_or_block_frozen_evidence() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let candidate = app
+        .submit_evaluation_candidate(CandidateImport {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            bundle_digest: case.bundle_digest.clone(),
+            actor: eval_agent("1.0"),
+            decision: ShadowDecision::NoChange { reason: None },
+            reason: None,
+            confidence: None,
+        })
+        .unwrap();
+    app.record_evaluation_outcome(
+        &case.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: None,
+        },
+    )
+    .unwrap();
+    commit(
+        &mut app,
+        Command::DeleteRecord {
+            object_id: object.clone(),
+            record_id: record.clone(),
+            expected_revision: Some(RecordRevision(1)),
+        },
+    );
+    assert!(matches!(
+        app.get_record(&object, &record),
+        Err(RowvaError::NotFound { .. })
+    ));
+    let export = app.export_evaluation_case(&case.id).unwrap();
+    assert_eq!(
+        evaluation_bundle_digest(&export.bundle).unwrap(),
+        export.bundle_digest
+    );
+    assert!(
+        app.replay_evaluation_candidate(&case.id, &candidate.id)
+            .unwrap()
+            .deterministic_match
+    );
+    let evidence: i64 = app
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_results WHERE case_id=?1",
+            [case.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence, 1);
+}
+
+#[test]
+fn replay_rejects_corrupted_candidate_fingerprint() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let candidate = app
+        .submit_evaluation_candidate(CandidateImport {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            bundle_digest: case.bundle_digest.clone(),
+            actor: eval_agent("1.0"),
+            decision: ShadowDecision::NoChange { reason: None },
+            reason: None,
+            confidence: None,
+        })
+        .unwrap();
+    app.conn
+        .execute(
+            "UPDATE _rowva_evaluation_candidates SET fingerprint='corrupted' WHERE id=?1",
+            [candidate.id.as_str()],
+        )
+        .unwrap();
+    assert!(
+        matches!(app.replay_evaluation_candidate(&case.id,&candidate.id),Err(RowvaError::Validation{code,..}) if code=="evaluation_candidate_fingerprint_mismatch")
+    );
+}
+
+#[test]
+fn missing_optional_relevant_value_is_frozen_as_null_and_capabilities_are_discarded() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    commit(
+        &mut app,
+        Command::CreateField {
+            object_id: object.clone(),
+            display_name: "Optional note".into(),
+            key: Some("optional_note".into()),
+            kind: FieldKind::Text(TextConfig::default()),
+            required: false,
+            unique: false,
+        },
+    );
+    let optional = app
+        .list_fields(&object)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.key == "optional_note")
+        .unwrap()
+        .id;
+    let case = app
+        .create_evaluation_case(EvaluationCaseCreate {
+            protocol_version: 1,
+            target_object_id: object.clone(),
+            target_record_id: record,
+            target_stage_field_id: stage,
+            relevant_field_ids: vec![optional.clone()],
+            input: DealStageQualificationInputV1 {
+                source_meeting_id: Some("synthetic".into()),
+                meeting_evidence: json!({}),
+                current_stage: json!("Discovery"),
+            },
+            creator: ActorContext::local_user(),
+        })
+        .unwrap();
+    assert_eq!(
+        case.bundle.record_snapshot.get(&optional),
+        Some(&Value::Null)
+    );
+    let mut agent = eval_agent("1.0");
+    agent.capabilities = Capability::all();
+    let candidate = app
+        .submit_evaluation_candidate(CandidateImport {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            bundle_digest: case.bundle_digest.clone(),
+            actor: agent,
+            decision: ShadowDecision::NoChange { reason: None },
+            reason: None,
+            confidence: None,
+        })
+        .unwrap();
+    assert!(candidate.actor.capabilities.is_empty());
+}
+
+#[test]
+fn human_reference_requires_exact_revision_and_stage_only_command() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let mut values = HashMap::new();
+    values.insert(stage.clone(), json!("Qualified"));
+    let without_revision = commit(
+        &mut app,
+        Command::UpdateRecord {
+            object_id: object.clone(),
+            record_id: record.clone(),
+            values,
+            expected_revision: None,
+        },
+    );
+    assert!(
+        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:without_revision.operation_id}),Err(RowvaError::Validation{code,..}) if code=="human_operation_revision_required")
+    );
+
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    commit(
+        &mut app,
+        Command::CreateField {
+            object_id: object.clone(),
+            display_name: "Note".into(),
+            key: Some("note".into()),
+            kind: FieldKind::Text(TextConfig::default()),
+            required: false,
+            unique: false,
+        },
+    );
+    let note = app
+        .list_fields(&object)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.key == "note")
+        .unwrap()
+        .id;
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let mut values = HashMap::new();
+    values.insert(stage, json!("Qualified"));
+    values.insert(note, json!("also changed"));
+    let extra = commit(
+        &mut app,
+        Command::UpdateRecord {
+            object_id: object,
+            record_id: record,
+            values,
+            expected_revision: Some(RecordRevision(1)),
+        },
+    );
+    assert!(
+        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:extra.operation_id}),Err(RowvaError::Validation{code,..}) if code=="human_operation_target_mismatch"||code=="human_operation_extra_changes")
+    );
 }

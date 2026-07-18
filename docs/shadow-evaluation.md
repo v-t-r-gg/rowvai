@@ -6,9 +6,15 @@ Shadow mode is parallel recommendation, not preview, approval, or execution. Row
 
 ## First workflow
 
-`deal_stage_qualification_v1` freezes immutable object, record, and stage-field IDs; schema and record revisions; the configured stage field; selected record values; structured synthetic meeting evidence; creator; and SHA-256 digests. The digest detects substitution but is not a signature. Only an exact update of the frozen stage field is valid. No-change and abstain are explicit decisions. Evidence and reasons are untrusted data, bounded at import, stored as JSON, and never interpreted as instructions.
+`deal_stage_qualification_v1` freezes immutable object, record, and stage-field IDs; schema and record revisions; the complete configured stage field; selected record values; structured synthetic meeting evidence; and a permitted-output schema. Missing optional selected values are represented as JSON `null`. Only an exact, single-value `StageUpdateProposalV1` against the frozen target and revision is valid; the general operation `Command` protocol is not accepted. No-change and abstain are explicit decisions.
 
-A human reference label is either linked to an existing committed human operation or recorded explicitly as no-change. The mutation is not replayed or duplicated. Recording an outcome closes blind collection. RowvAI can prove which bundle a candidate bound and what the evaluation interface exposed; it cannot prove an external agent did not inspect live state elsewhere.
+The exported object is `{ "bundle": EvaluationCaseBundleV1, "bundle_digest": "..." }`. The digest covers exactly `bundle`, including nested evidence, field configuration, and `permitted_output_schema`. To recompute it, recursively sort every JSON object key lexicographically, preserve array order and JSON scalar types, serialize compact UTF-8 JSON, then calculate lowercase hexadecimal SHA-256. The public Rust helpers are `canonical_json_bytes` and `evaluation_bundle_digest`. Export, candidate submission, and replay recompute stored integrity; replay also verifies the candidate-bound digest and candidate fingerprint. SHA-256 detects modification here—it is neither a signature nor proof of authorship.
+
+Evidence, actor labels, versions, client/session IDs, and reasons are untrusted and byte-bounded at import. Imported capabilities are discarded before actor persistence and never convey authority. Selected field IDs are bounded, unique, and verified against the target object.
+
+A human reference label is either linked to an existing committed human stage-only `UpdateRecord` operation or recorded explicitly as no-change. A linked operation must have an expected record revision, matching base schema revision, matching frozen before-stage, and a valid after-stage. The mutation is not replayed or duplicated. Recording an outcome closes blind collection. RowvAI can prove which bundle a candidate bound and what the evaluation interface exposed; it cannot prove an external agent did not inspect live state elsewhere.
+
+Historical target IDs are snapshots, not foreign keys to mutable CRM rows. Deleting a live record therefore neither blocks normal CRM behavior nor cascades evaluation evidence; replay continues from the frozen snapshot.
 
 ## Replay versus reevaluation
 
@@ -16,7 +22,11 @@ Deterministic semantic replay reloads the sealed snapshot, runs the versioned fr
 
 ## Scores and reports
 
-Rubric revision 1 distinguishes exact change agreement, no-change agreement, false positives, false negatives, wrong stages, abstentions, and structured invalid proposals. Reports group by workflow, actor ID, and required actor version and return raw counts beside rates. Readiness revision 1 is conservative: fewer than 20 scored candidates is `insufficient_evidence`; error/invalid rates above 10% are `not_ready`; 90% agreement with sufficient evidence is only `candidate_for_human_review`. These are initial advisory heuristics, not statistical guarantees and never change policy, capabilities, approvals, or execution authority.
+At most one candidate per `(case_id, actor_id, actor_version)` is eligible for metrics. The first attempt is eligible; later retries are retained with attempt number and predecessor linkage but are ineligible, so retries cannot improve readiness. Different versions remain independently eligible.
+
+Reports start from all candidate evidence, including pending and ineligible rows. They expose available cases, distinct attempted cases, submitted attempts, eligible decisions, ineligible retries, pending eligible decisions, scored eligible decisions, valid/invalid scored decisions, exclusions, and each verdict. `agreement_count = exact_change_agreements + no_change_agreements`. Accuracy uses non-abstaining eligible scored decisions; abstentions reduce coverage and are excluded from accuracy. Coverage is non-abstaining divided by eligible scored; invalid-proposal rate is invalid scored divided by eligible scored. A zero denominator produces `null`, not an invented rate.
+
+Readiness revision 1 uses those same definitions. Fewer than 20 eligible scored decisions is `insufficient_evidence`; coverage below 80% is `not_ready`; error/invalid outcomes above 10% of non-abstaining decisions are `not_ready`; and at least 90% combined agreement can yield only `candidate_for_human_review`. Exactly 10% error remains within the threshold. These are initial advisory heuristics, not statistical guarantees and never change policy, capabilities, approvals, or execution authority.
 
 ## Developer workflow
 
@@ -30,4 +40,6 @@ cargo run -p rowva-eval -- replay --workspace /absolute/demo.rowva --case-id evc
 cargo run -p rowva-eval -- report --workspace /absolute/demo.rowva --json
 ```
 
-Committed fixtures are synthetic and network-free. Put private local dogfood inputs beneath `.local/eval/`, which Git ignores. Operators remain responsible for file permissions because meeting evidence, snapshots, reasons, and model output may contain sensitive data. Field-level redaction, configurable retention, a desktop dashboard, model invocation, additional workflows, and proof of external blindness are deferred.
+`fixture run` creates a temporary workspace per scenario, constructs schema and data, verifies export integrity, submits candidates, records the human reference, scores, replays, compares expected verdicts, and checks that shadow actions did not mutate authoritative state. Any mismatch exits nonzero. Committed fixtures are synthetic and network-free.
+
+Put private local dogfood inputs beneath `.local/eval/`, which Git ignores. Operators remain responsible for file permissions because meeting evidence, snapshots, reasons, and model output may contain sensitive data. Evaluation evidence is retained append-only and can contain values; field-level redaction, configurable retention, a desktop dashboard, model invocation, additional workflows, and proof of external blindness are deferred.

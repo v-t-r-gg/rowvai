@@ -1124,11 +1124,19 @@ impl EvaluationApplication for SqliteApplication {
                 "meeting evidence exceeds 64 KiB",
             ));
         }
+        if input.relevant_field_ids.len() > MAX_RELEVANT_FIELDS {
+            return Err(RowvaError::validation(
+                "too_many_relevant_fields",
+                "evaluation case exceeds the relevant-field limit",
+            ));
+        }
         let record = self.get_record(&input.target_object_id, &input.target_record_id)?;
-        let field = self
-            .list_fields(&input.target_object_id)?
+        let fields = self.list_fields(&input.target_object_id)?;
+        let field = fields
+            .iter()
             .into_iter()
             .find(|f| f.id == input.target_stage_field_id)
+            .cloned()
             .ok_or_else(|| RowvaError::not_found("field", input.target_stage_field_id.as_str()))?;
         let current = record.values.get(&field.id).cloned().unwrap_or(Value::Null);
         if current != input.input.current_stage {
@@ -1139,20 +1147,47 @@ impl EvaluationApplication for SqliteApplication {
         }
         let mut snapshot = HashMap::new();
         snapshot.insert(field.id.clone(), current.clone());
+        let mut seen = HashSet::new();
         for id in &input.relevant_field_ids {
-            let value = record
-                .values
-                .get(id)
-                .ok_or_else(|| RowvaError::not_found("field", id.as_str()))?;
-            snapshot.insert(id.clone(), value.clone());
+            if !seen.insert(id.clone()) {
+                return Err(RowvaError::validation(
+                    "duplicate_relevant_field",
+                    "relevant field IDs must be unique",
+                ));
+            }
+            if !fields.iter().any(|candidate| candidate.id == *id) {
+                return Err(RowvaError::not_found("field", id.as_str()));
+            }
+            snapshot.insert(
+                id.clone(),
+                record.values.get(id).cloned().unwrap_or(Value::Null),
+            );
         }
         let id = EvaluationCaseId::new();
         let now = Utc::now();
         let schema = self.schema_revision()?;
-        let evidence_digest = hash_json(&input.input.meeting_evidence)?;
-        let bundle_value = json!({"protocol_version":1,"case_id":id,"workspace_id":self.workspace_id,"workflow":"deal_stage_qualification_v1","workflow_version":1,"object_id":input.target_object_id,"record_id":input.target_record_id,"stage_field":field,"schema_revision":schema,"record_revision":record.revision,"record_snapshot":snapshot,"input":input.input});
-        let bundle_digest = hash_json(&bundle_value)?;
+        validate_evaluation_texts(&input.input)?;
+        let creator = validate_evaluation_actor(&input.creator, false)?;
+        let bundle = EvaluationCaseBundleV1 {
+            protocol_version: EVALUATION_PROTOCOL_VERSION,
+            case_id: id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            workflow: EvaluationWorkflow::DealStageQualificationV1,
+            workflow_version: 1,
+            target_object_id: input.target_object_id.clone(),
+            target_record_id: input.target_record_id.clone(),
+            target_stage_field: field.clone(),
+            base_schema_revision: schema,
+            base_record_revision: record.revision,
+            record_snapshot: snapshot.clone(),
+            current_stage: current.clone(),
+            input: input.input.clone(),
+            permitted_output_schema: permitted_output_schema_v1(),
+        };
+        let evidence_digest = sha256_digest(&input.input.meeting_evidence)?;
+        let bundle_digest = evaluation_bundle_digest(&bundle)?;
         let case = EvaluationCase {
+            bundle,
             id: id.clone(),
             workspace_id: self.workspace_id.clone(),
             workflow: EvaluationWorkflow::DealStageQualificationV1,
@@ -1167,7 +1202,7 @@ impl EvaluationApplication for SqliteApplication {
             input: input.input,
             evidence_digest,
             bundle_digest,
-            creator: input.creator,
+            creator,
             created_at: now,
             status: EvaluationCaseStatus::CollectingCandidates,
             invalidated_at: None,
@@ -1189,21 +1224,10 @@ impl EvaluationApplication for SqliteApplication {
         id: &EvaluationCaseId,
     ) -> Result<EvaluationCaseExport, RowvaError> {
         let c = self.get_evaluation_case(id)?;
+        verify_case_integrity(&c)?;
         Ok(EvaluationCaseExport {
-            protocol_version: 1,
-            case_id: c.id,
-            workflow: c.workflow,
-            workflow_version: c.workflow_version,
+            bundle: c.bundle,
             bundle_digest: c.bundle_digest,
-            target_object_id: c.target_object_id,
-            target_record_id: c.target_record_id,
-            target_stage_field: c.target_stage_field,
-            base_schema_revision: c.base_schema_revision,
-            base_record_revision: c.base_record_revision,
-            record_snapshot: c.record_snapshot,
-            current_stage: c.current_stage,
-            input: c.input,
-            permitted_output_schema: json!({"one_of":["propose_stage_update","no_change","abstain"],"only_target_stage_field":true}),
         })
     }
 
@@ -1249,6 +1273,7 @@ impl EvaluationApplication for SqliteApplication {
             ));
         }
         let case = self.get_evaluation_case(&input.case_id)?;
+        verify_case_integrity(&case)?;
         if case.bundle_digest != input.bundle_digest {
             return Err(RowvaError::validation(
                 "bundle_digest_mismatch",
@@ -1266,9 +1291,22 @@ impl EvaluationApplication for SqliteApplication {
             Ok(c) => (CandidateValidationStatus::Valid, None, c),
             Err((s, e)) => (s, Some(e), vec![]),
         };
-        let fingerprint = hash_json(
-            &json!({"protocol_version":1,"case_id":input.case_id,"bundle_digest":input.bundle_digest,"actor_id":input.actor.id,"actor_version":input.actor.actor_version,"decision":input.decision,"reason":input.reason,"confidence":input.confidence}),
-        )?;
+        validate_candidate_texts(&input)?;
+        let mut input = input;
+        input.actor = validate_evaluation_actor(&input.actor, true)?;
+        let fingerprint = candidate_fingerprint(&input)?;
+        let actor_version = input.actor.actor_version.clone().unwrap_or_default();
+        let prior: Option<(i64,String)> = self.conn.query_row("SELECT attempt_number,id FROM _rowva_evaluation_candidates WHERE case_id=?1 AND actor_id=?2 AND actor_version=?3 ORDER BY attempt_number DESC LIMIT 1",params![input.case_id.as_str(),input.actor.id.as_str(),actor_version],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage)?;
+        let (attempt_number, eligible_for_metrics, eligibility_reason, supersedes_candidate_id) =
+            match prior {
+                Some((n, id)) => (
+                    n as u32 + 1,
+                    false,
+                    "retry_after_eligible".to_owned(),
+                    Some(EvaluationCandidateId::from_string(id)?),
+                ),
+                None => (1, true, "first_attempt".to_owned(), None),
+            };
         let candidate = EvaluationCandidate {
             id: EvaluationCandidateId::new(),
             case_id: input.case_id,
@@ -1276,6 +1314,7 @@ impl EvaluationApplication for SqliteApplication {
             workflow_version: case.workflow_version,
             bundle_digest: input.bundle_digest,
             actor: input.actor,
+            actor_version,
             decision: input.decision,
             reason: input.reason,
             confidence: input.confidence,
@@ -1283,12 +1322,15 @@ impl EvaluationApplication for SqliteApplication {
             submitted_at: Utc::now(),
             validation_status: status,
             validation_error: error,
-            eligible_for_metrics: true,
+            eligible_for_metrics,
+            attempt_number,
+            eligibility_reason,
+            supersedes_candidate_id,
             normalized_changes: changes,
         };
         let tx = self.conn.transaction().map_err(storage)?;
         upsert_actor(&tx, &candidate.actor, &candidate.submitted_at.to_rfc3339())?;
-        tx.execute("INSERT INTO _rowva_evaluation_candidates(id,case_id,workflow_version,bundle_digest,actor_id,actor_json,decision_json,reason,confidence,fingerprint,submitted_at,validation_status,validation_error_json,eligible_for_metrics,normalized_changes_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14)",params![candidate.id.as_str(),candidate.case_id.as_str(),candidate.workflow_version,candidate.bundle_digest,candidate.actor.id.as_str(),serde_json::to_string(&candidate.actor).map_err(internal)?,serde_json::to_string(&candidate.decision).map_err(internal)?,candidate.reason,candidate.confidence,candidate.fingerprint,candidate.submitted_at.to_rfc3339(),validation_status(candidate.validation_status),candidate.validation_error.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,serde_json::to_string(&candidate.normalized_changes).map_err(internal)?]).map_err(constraint)?;
+        tx.execute("INSERT INTO _rowva_evaluation_candidates(id,case_id,workflow_version,bundle_digest,actor_id,actor_version,actor_json,decision_json,reason,confidence,fingerprint,submitted_at,validation_status,validation_error_json,eligible_for_metrics,attempt_number,eligibility_reason,supersedes_candidate_id,normalized_changes_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",params![candidate.id.as_str(),candidate.case_id.as_str(),candidate.workflow_version,candidate.bundle_digest,candidate.actor.id.as_str(),candidate.actor_version,serde_json::to_string(&candidate.actor).map_err(internal)?,serde_json::to_string(&candidate.decision).map_err(internal)?,candidate.reason,candidate.confidence,candidate.fingerprint,candidate.submitted_at.to_rfc3339(),validation_status(candidate.validation_status),candidate.validation_error.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,candidate.eligible_for_metrics,candidate.attempt_number,candidate.eligibility_reason,candidate.supersedes_candidate_id.as_ref().map(EvaluationCandidateId::as_str),serde_json::to_string(&candidate.normalized_changes).map_err(internal)?]).map_err(constraint)?;
         tx.commit().map_err(storage)?;
         Ok(candidate)
     }
@@ -1298,6 +1340,23 @@ impl EvaluationApplication for SqliteApplication {
         id: &EvaluationCaseId,
         input: HumanEvaluationOutcomeInput,
     ) -> Result<Vec<EvaluationResult>, RowvaError> {
+        let input = match input {
+            HumanEvaluationOutcomeInput::NoChange { actor, reason } => {
+                if let Some(value) = &reason {
+                    if value.len() > MAX_REASON_BYTES {
+                        return Err(RowvaError::validation(
+                            "human_no_change_reason_too_long",
+                            "human no-change reason exceeds the limit",
+                        ));
+                    }
+                }
+                HumanEvaluationOutcomeInput::NoChange {
+                    actor: validate_evaluation_actor(&actor, false)?,
+                    reason,
+                }
+            }
+            other => other,
+        };
         let case = self.get_evaluation_case(id)?;
         if case.status != EvaluationCaseStatus::CollectingCandidates {
             return Err(RowvaError::Conflict {
@@ -1332,27 +1391,74 @@ impl EvaluationApplication for SqliteApplication {
                         "outcome must link a committed human operation",
                     ));
                 }
-                let change = operation
-                    .changes
-                    .iter()
-                    .find(|c| {
-                        c.object_id == case.target_object_id
-                            && c.record_id.as_ref() == Some(&case.target_record_id)
-                            && c.field_id.as_ref() == Some(&case.target_stage_field.id)
-                    })
-                    .ok_or_else(|| {
-                        RowvaError::validation(
-                            "human_operation_target_mismatch",
-                            "operation does not change the evaluated stage",
-                        )
-                    })?;
+                if operation.base_schema_revision != case.base_schema_revision {
+                    return Err(RowvaError::validation(
+                        "human_operation_schema_mismatch",
+                        "operation schema revision does not match the frozen case",
+                    ));
+                }
+                let request: OperationRequest = serde_json::from_value(operation.request.clone())
+                    .map_err(|_| {
+                    RowvaError::validation(
+                        "invalid_human_operation_request",
+                        "stored operation request cannot be verified",
+                    )
+                })?;
+                match &request.command {
+                    Command::UpdateRecord {
+                        object_id,
+                        record_id,
+                        values,
+                        expected_revision: Some(revision),
+                    } if object_id == &case.target_object_id
+                        && record_id == &case.target_record_id
+                        && revision == &case.base_record_revision
+                        && values.len() == 1
+                        && values.contains_key(&case.target_stage_field.id) => {}
+                    Command::UpdateRecord {
+                        expected_revision: None,
+                        ..
+                    } => {
+                        return Err(RowvaError::validation(
+                            "human_operation_revision_required",
+                            "reference operation must include the frozen expected revision",
+                        ))
+                    }
+                    _ => return Err(RowvaError::validation(
+                        "human_operation_target_mismatch",
+                        "reference operation must be a stage-only update against the frozen target",
+                    )),
+                }
+                if operation.changes.len() != 1 {
+                    return Err(RowvaError::validation(
+                        "human_operation_extra_changes",
+                        "reference operation must change only the evaluated stage",
+                    ));
+                }
+                let change = &operation.changes[0];
+                if change.object_id != case.target_object_id
+                    || change.record_id.as_ref() != Some(&case.target_record_id)
+                    || change.field_id.as_ref() != Some(&case.target_stage_field.id)
+                {
+                    return Err(RowvaError::validation(
+                        "human_operation_target_mismatch",
+                        "operation does not change the evaluated stage",
+                    ));
+                }
                 if change.before.as_ref() != Some(&case.current_stage) {
                     return Err(RowvaError::validation(
                         "human_operation_base_mismatch",
                         "human operation is incompatible with the frozen stage",
                     ));
                 }
-                change.after.clone().unwrap_or(Value::Null)
+                let after = change.after.clone().unwrap_or(Value::Null);
+                if !field_value_is_valid(&case.target_stage_field, &after) {
+                    return Err(RowvaError::validation(
+                        "human_operation_invalid_stage",
+                        "operation result is invalid for the frozen stage field",
+                    ));
+                }
+                after
             }
         };
         let candidates = load_candidates(&self.conn, id)?;
@@ -1382,10 +1488,32 @@ impl EvaluationApplication for SqliteApplication {
     ) -> Result<FrozenReplayResult, RowvaError> {
         let case = self.get_evaluation_case(case_id)?;
         let candidate = load_candidate(&self.conn, candidate_id)?;
+        verify_case_integrity(&case)?;
         if candidate.case_id != *case_id {
             return Err(RowvaError::validation(
                 "candidate_case_mismatch",
                 "candidate belongs to another case",
+            ));
+        }
+        if candidate.bundle_digest != case.bundle_digest {
+            return Err(RowvaError::validation(
+                "evaluation_candidate_bundle_mismatch",
+                "candidate is not bound to the verified case bundle",
+            ));
+        }
+        let fingerprint_input = CandidateImport {
+            protocol_version: EVALUATION_PROTOCOL_VERSION,
+            case_id: candidate.case_id.clone(),
+            bundle_digest: candidate.bundle_digest.clone(),
+            actor: candidate.actor.clone(),
+            decision: candidate.decision.clone(),
+            reason: candidate.reason.clone(),
+            confidence: candidate.confidence,
+        };
+        if candidate_fingerprint(&fingerprint_input)? != candidate.fingerprint {
+            return Err(RowvaError::validation(
+                "evaluation_candidate_fingerprint_mismatch",
+                "stored candidate evidence failed integrity verification",
             ));
         }
         let (status, error, changes) = match plan_frozen_candidate(&case, &candidate.decision) {
@@ -1408,104 +1536,120 @@ impl EvaluationApplication for SqliteApplication {
     }
 
     fn evaluation_report(&self) -> Result<Vec<EvaluationMetrics>, RowvaError> {
-        let mut stmt=self.conn.prepare("SELECT c.actor_id,c.actor_json,c.case_id,r.verdict,r.eligible FROM _rowva_evaluation_results r JOIN _rowva_evaluation_candidates c ON c.id=r.candidate_id ORDER BY c.actor_id").map_err(storage)?;
+        let cases_available = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM _rowva_evaluation_cases WHERE status!='invalidated'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage)? as u64;
+        let mut stmt=self.conn.prepare("SELECT c.actor_id,c.actor_version,c.case_id,c.eligible_for_metrics,c.validation_status,c.eligibility_reason,r.verdict FROM _rowva_evaluation_candidates c LEFT JOIN _rowva_evaluation_results r ON r.candidate_id=c.id ORDER BY c.actor_id,c.actor_version,c.submitted_at,c.id").map_err(storage)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, bool>(4)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(storage)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage)?;
-        type Group = (ActorId, EvaluationCounts, HashSet<String>, HashSet<String>);
+        type Group = (ActorId, EvaluationCounts, HashSet<String>);
         let mut grouped: HashMap<(String, String), Group> = HashMap::new();
-        for (actor_id, actor_json, case_id, verdict, eligible) in rows {
-            let actor: ActorContext = serde_json::from_str(&actor_json).map_err(internal)?;
-            let version = actor
-                .actor_version
-                .clone()
-                .unwrap_or_else(|| "unknown".into());
+        for (actor_id, version, case_id, eligible, validation, eligibility_reason, verdict) in rows
+        {
+            let parsed_actor_id = ActorId::from_string(actor_id.clone())?;
             let entry = grouped.entry((actor_id, version)).or_insert((
-                actor.id,
+                parsed_actor_id,
                 EvaluationCounts::default(),
                 HashSet::new(),
-                HashSet::new(),
             ));
-            entry.1.candidates_submitted += 1;
-            entry.1.scored_candidates += 1;
+            entry.1.total_submitted_attempts += 1;
             entry.2.insert(case_id.clone());
-            if eligible {
-                entry.3.insert(case_id);
+            if !eligible {
+                entry.1.ineligible_retries += 1;
+                *entry
+                    .1
+                    .exclusions_by_reason
+                    .entry(eligibility_reason)
+                    .or_default() += 1;
+                continue;
+            }
+            entry.1.eligible_decisions += 1;
+            let Some(verdict) = verdict else {
+                entry.1.pending_unscored_eligible += 1;
+                continue;
+            };
+            entry.1.scored_eligible += 1;
+            let valid = validation == "valid";
+            if valid {
+                entry.1.valid_scored += 1;
+            } else {
+                entry.1.invalid_scored += 1;
+                *entry.1.exclusions_by_reason.entry(validation).or_default() += 1;
             }
             match verdict.as_str() {
                 "exact_agreement" => {
-                    entry.1.exact_agreements += 1;
-                    entry.1.valid_candidates += 1
+                    entry.1.exact_change_agreements += 1;
+                    entry.1.agreement_count += 1;
                 }
                 "no_change_agreement" => {
                     entry.1.no_change_agreements += 1;
-                    entry.1.valid_candidates += 1
+                    entry.1.agreement_count += 1;
                 }
-                "false_positive" => {
-                    entry.1.false_positives += 1;
-                    entry.1.valid_candidates += 1
-                }
-                "false_negative" => {
-                    entry.1.false_negatives += 1;
-                    entry.1.valid_candidates += 1
-                }
-                "wrong_stage" => {
-                    entry.1.wrong_stage += 1;
-                    entry.1.valid_candidates += 1
-                }
-                "abstained" => {
-                    entry.1.abstentions += 1;
-                    entry.1.valid_candidates += 1
-                }
-                _ => entry.1.invalid_candidates += 1,
+                "false_positive" => entry.1.false_positives += 1,
+                "false_negative" => entry.1.false_negatives += 1,
+                "wrong_stage" => entry.1.wrong_stage += 1,
+                "abstained" => entry.1.abstentions += 1,
+                _ => {}
             }
         }
         Ok(grouped
             .into_iter()
-            .map(
-                |((_id, version), (actor_id, mut c, cases, eligible_cases))| {
-                    c.total_cases = cases.len() as u64;
-                    c.eligible_cases = eligible_cases.len() as u64;
-                    let scored = c.scored_candidates.max(1) as f64;
-                    let submitted = c.candidates_submitted.max(1) as f64;
-                    let (class, reasons) = readiness(&c);
-                    EvaluationMetrics {
-                        workflow: EvaluationWorkflow::DealStageQualificationV1,
-                        actor_id,
-                        actor_version: version,
-                        exact_agreement_rate: (c.exact_agreements + c.no_change_agreements) as f64
-                            / scored,
-                        coverage_rate: (c.scored_candidates - c.abstentions) as f64 / scored,
-                        invalid_proposal_rate: c.invalid_candidates as f64 / submitted,
-                        counts: c,
-                        readiness_rubric_revision: 1,
-                        readiness: class,
-                        readiness_reasons: reasons,
-                        advisory_only: true,
-                    }
-                },
-            )
+            .map(|((_id, version), (actor_id, mut c, cases))| {
+                c.cases_available = cases_available;
+                c.distinct_cases_attempted = cases.len() as u64;
+                let accuracy_denominator = c.scored_eligible.saturating_sub(c.abstentions);
+                let (class, reasons) = readiness(&c);
+                EvaluationMetrics {
+                    workflow: EvaluationWorkflow::DealStageQualificationV1,
+                    actor_id,
+                    actor_version: version,
+                    agreement_rate: (accuracy_denominator > 0)
+                        .then(|| c.agreement_count as f64 / accuracy_denominator as f64),
+                    exact_change_agreement_rate: (accuracy_denominator > 0)
+                        .then(|| c.exact_change_agreements as f64 / accuracy_denominator as f64),
+                    coverage_rate: (c.scored_eligible > 0)
+                        .then(|| accuracy_denominator as f64 / c.scored_eligible as f64),
+                    invalid_proposal_rate: (c.scored_eligible > 0)
+                        .then(|| c.invalid_scored as f64 / c.scored_eligible as f64),
+                    counts: c,
+                    readiness_rubric_revision: 1,
+                    readiness: class,
+                    readiness_reasons: reasons,
+                    advisory_only: true,
+                }
+            })
             .collect())
     }
 }
 
-fn hash_json(value: &Value) -> Result<String, RowvaError> {
-    let bytes = serde_json::to_vec(&canonical_json(value)).map_err(internal)?;
-    Ok(Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+fn verify_case_integrity(case: &EvaluationCase) -> Result<(), RowvaError> {
+    if evaluation_bundle_digest(&case.bundle)? != case.bundle_digest {
+        return Err(RowvaError::validation(
+            "evaluation_bundle_integrity_mismatch",
+            "stored evaluation bundle failed integrity verification",
+        ));
+    }
+    Ok(())
 }
+
 fn load_evaluation_case(
     conn: &Connection,
     id: &EvaluationCaseId,
@@ -1531,19 +1675,43 @@ fn load_evaluation_case(
         Option<String>,
     );
     let r:R=conn.query_row("SELECT workspace_id,target_object_id,target_record_id,target_stage_field_id,workflow,base_schema_revision,base_record_revision,current_stage_json,record_snapshot_json,input_json,target_field_json,evidence_digest,bundle_digest,creator_json,created_at,status,invalidated_at,invalidation_reason FROM _rowva_evaluation_cases WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?))).optional().map_err(storage)?.ok_or_else(||RowvaError::not_found("evaluation_case",id.as_str()))?;
-    Ok(EvaluationCase {
-        id: id.clone(),
-        workspace_id: WorkspaceId::from_string(r.0)?,
+    let workspace_id = WorkspaceId::from_string(r.0)?;
+    let target_object_id = ObjectId::from_string(r.1)?;
+    let target_record_id = RecordId::from_string(r.2)?;
+    let target_stage_field: FieldDefinition = serde_json::from_str(&r.10).map_err(internal)?;
+    let record_snapshot: HashMap<FieldId, Value> = serde_json::from_str(&r.8).map_err(internal)?;
+    let current_stage: Value = serde_json::from_str(&r.7).map_err(internal)?;
+    let input: DealStageQualificationInputV1 = serde_json::from_str(&r.9).map_err(internal)?;
+    let bundle = EvaluationCaseBundleV1 {
+        protocol_version: EVALUATION_PROTOCOL_VERSION,
+        case_id: id.clone(),
+        workspace_id: workspace_id.clone(),
         workflow: EvaluationWorkflow::DealStageQualificationV1,
         workflow_version: 1,
-        target_object_id: ObjectId::from_string(r.1)?,
-        target_record_id: RecordId::from_string(r.2)?,
-        target_stage_field: serde_json::from_str(&r.10).map_err(internal)?,
+        target_object_id: target_object_id.clone(),
+        target_record_id: target_record_id.clone(),
+        target_stage_field: target_stage_field.clone(),
         base_schema_revision: SchemaRevision(r.5),
         base_record_revision: RecordRevision(r.6),
-        current_stage: serde_json::from_str(&r.7).map_err(internal)?,
-        record_snapshot: serde_json::from_str(&r.8).map_err(internal)?,
-        input: serde_json::from_str(&r.9).map_err(internal)?,
+        record_snapshot: record_snapshot.clone(),
+        current_stage: current_stage.clone(),
+        input: input.clone(),
+        permitted_output_schema: permitted_output_schema_v1(),
+    };
+    Ok(EvaluationCase {
+        bundle,
+        id: id.clone(),
+        workspace_id,
+        workflow: EvaluationWorkflow::DealStageQualificationV1,
+        workflow_version: 1,
+        target_object_id,
+        target_record_id,
+        target_stage_field,
+        base_schema_revision: SchemaRevision(r.5),
+        base_record_revision: RecordRevision(r.6),
+        current_stage,
+        record_snapshot,
+        input,
         evidence_digest: r.11,
         bundle_digest: r.12,
         creator: serde_json::from_str(&r.13).map_err(internal)?,
@@ -1586,6 +1754,7 @@ fn load_candidate(
         String,
         String,
         String,
+        String,
         Option<String>,
         Option<f64>,
         String,
@@ -1593,28 +1762,35 @@ fn load_candidate(
         String,
         Option<String>,
         bool,
+        i64,
+        String,
+        Option<String>,
         String,
     );
-    let r:R=conn.query_row("SELECT case_id,workflow_version,bundle_digest,actor_json,decision_json,reason,confidence,fingerprint,submitted_at,validation_status,validation_error_json,eligible_for_metrics,normalized_changes_json FROM _rowva_evaluation_candidates WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?))).optional().map_err(storage)?.ok_or_else(||RowvaError::not_found("evaluation_candidate",id.as_str()))?;
+    let r:R=conn.query_row("SELECT case_id,workflow_version,bundle_digest,actor_version,actor_json,decision_json,reason,confidence,fingerprint,submitted_at,validation_status,validation_error_json,eligible_for_metrics,attempt_number,eligibility_reason,supersedes_candidate_id,normalized_changes_json FROM _rowva_evaluation_candidates WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?))).optional().map_err(storage)?.ok_or_else(||RowvaError::not_found("evaluation_candidate",id.as_str()))?;
     Ok(EvaluationCandidate {
         id: id.clone(),
         case_id: EvaluationCaseId::from_string(r.0)?,
         workflow: EvaluationWorkflow::DealStageQualificationV1,
         workflow_version: r.1 as u16,
         bundle_digest: r.2,
-        actor: serde_json::from_str(&r.3).map_err(internal)?,
-        decision: serde_json::from_str(&r.4).map_err(internal)?,
-        reason: r.5,
-        confidence: r.6,
-        fingerprint: r.7,
-        submitted_at: parse_time(r.8),
-        validation_status: parse_validation_status(&r.9),
+        actor_version: r.3,
+        actor: serde_json::from_str(&r.4).map_err(internal)?,
+        decision: serde_json::from_str(&r.5).map_err(internal)?,
+        reason: r.6,
+        confidence: r.7,
+        fingerprint: r.8,
+        submitted_at: parse_time(r.9),
+        validation_status: parse_validation_status(&r.10),
         validation_error: r
-            .10
+            .11
             .map(|v| serde_json::from_str(&v).map_err(internal))
             .transpose()?,
-        eligible_for_metrics: r.11,
-        normalized_changes: serde_json::from_str(&r.12).map_err(internal)?,
+        eligible_for_metrics: r.12,
+        attempt_number: r.13 as u32,
+        eligibility_reason: r.14,
+        supersedes_candidate_id: r.15.map(EvaluationCandidateId::from_string).transpose()?,
+        normalized_changes: serde_json::from_str(&r.16).map_err(internal)?,
     })
 }
 fn validation_status(v: CandidateValidationStatus) -> &'static str {

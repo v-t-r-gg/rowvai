@@ -26,6 +26,7 @@ The desktop includes an Agent Activity inbox for governed changes. Shadow evalua
 npm install
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo run -p rowva-eval -- fixture run fixtures/shadow/deal_stage_cases.json --json
 npm run build
 npm run tauri dev
 ./target/debug/rowva-mcp --help

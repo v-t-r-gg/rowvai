@@ -11,6 +11,6 @@ rowva-core = { path = "../rowva-core" }
 rowva-store-sqlite = { path = "../rowva-store-sqlite" }
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
