@@ -1,0 +1,22 @@
+{
+  "fixture_protocol_version": 1,
+  "synthetic": true,
+  "scenarios": [
+    { "name": "balanced_references", "expected": true },
+    { "name": "imbalanced_no_change", "expected": true },
+    { "name": "duplicate_content", "expected": true },
+    { "name": "repeated_meeting_evidence", "expected": true },
+    { "name": "repeated_source_meeting_id", "expected": true },
+    { "name": "missing_candidate_coverage", "expected": true },
+    { "name": "abstentions", "expected": true },
+    { "name": "invalid_candidates", "expected": true },
+    { "name": "well_calibrated_confidence", "expected": true },
+    { "name": "overconfident_incorrect", "expected": true },
+    { "name": "underconfident_correct", "expected": true },
+    { "name": "invalidation_after_dataset", "expected": true },
+    { "name": "historical_analysis_immutable", "expected": true },
+    { "name": "new_analysis_excludes_invalidated", "expected": true },
+    { "name": "metadata_privacy", "expected": true },
+    { "name": "full_local_sensitive", "expected": true }
+  ]
+}

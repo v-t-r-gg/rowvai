@@ -42,6 +42,44 @@ fn fixture_runs_offline_and_invalid_input_fails() {
 }
 
 #[test]
+fn quality_fixture_executes_all_scenarios_and_privacy_checks() {
+    let bin = env!("CARGO_BIN_EXE_rowva-eval");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/quality/deal_stage_quality_cases.json");
+    let output = ProcessCommand::new(bin)
+        .args(["--json", "fixture", "quality-run"])
+        .arg(fixture)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["scenarios_attempted"], 16);
+    assert_eq!(summary["passed"], 16);
+    assert_eq!(summary["failed"], 0);
+    assert_eq!(
+        summary["privacy_checks"]["metadata_sentinels_excluded"],
+        true
+    );
+    assert_eq!(
+        summary["privacy_checks"]["full_local_sentinels_present"],
+        true
+    );
+    assert_eq!(
+        summary["integrity_checks"]["identical_analysis_idempotent"],
+        true
+    );
+    assert_eq!(summary["integrity_checks"]["approval_changes"], 0);
+    assert_eq!(
+        summary["integrity_checks"]["shadow_record_mutations"],
+        false
+    );
+}
+
+#[test]
 fn process_case_export_import_outcome_replay_and_report() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("eval.rowva");

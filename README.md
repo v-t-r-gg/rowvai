@@ -29,6 +29,7 @@ npm install
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo run -p rowva-eval -- fixture run fixtures/shadow/deal_stage_cases.json --json
+cargo run -p rowva-eval -- fixture quality-run fixtures/quality/deal_stage_quality_cases.json --json
 npm run build
 npm run tauri dev
 ./target/debug/rowva-mcp --help

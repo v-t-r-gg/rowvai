@@ -480,7 +480,54 @@ pub struct ConfidenceCalibrationV1 {
     pub abstentions_excluded: u64,
     pub invalid_excluded: u64,
     pub retries_excluded: u64,
+    pub invalidated_cases_excluded: u64,
+    pub missing_outcomes_excluded: u64,
+    pub unscored_candidates_excluded: u64,
+    pub integrity_failures_excluded: u64,
     pub bins: Vec<CalibrationBinV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedHumanOutcomeEvidenceV1 {
+    pub protocol_version: u16,
+    pub case_id: EvaluationCaseId,
+    pub outcome: HumanEvaluationOutcomeInput,
+    pub normalized_stage: Value,
+    pub operation_evidence: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationAnalysisCaseEvidenceV1 {
+    pub case_id: EvaluationCaseId,
+    pub case_bundle_digest: String,
+    pub lifecycle_status: EvaluationCaseStatus,
+    pub invalidation_evidence: Option<Value>,
+    pub eligible_candidate: Option<EvaluationCandidate>,
+    pub retry_candidates: Vec<EvaluationCandidate>,
+    pub human_outcome: Option<VerifiedHumanOutcomeEvidenceV1>,
+    pub requested_scorer_revision: u16,
+    pub scorer_result: Option<EvaluationResult>,
+    pub scorer_result_verified: bool,
+    pub inclusion: String,
+    pub content_identity_digest: String,
+    pub meeting_evidence_digest: String,
+    pub source_meeting_id: Option<String>,
+    pub target_revision_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationAnalysisEvidenceV1 {
+    pub protocol_version: u16,
+    pub dataset_id: EvaluationDatasetId,
+    pub dataset_digest: String,
+    pub workflow: EvaluationWorkflow,
+    pub workflow_version: u16,
+    pub target_actor_id: ActorId,
+    pub target_actor_version: String,
+    pub cases: Vec<EvaluationAnalysisCaseEvidenceV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -508,6 +555,7 @@ pub struct EvaluationAnalysisRun {
     pub analysis_input_digest: String,
     pub report_digest: String,
     pub created_at: DateTime<Utc>,
+    pub evidence: EvaluationAnalysisEvidenceV1,
     pub report: EvaluationAnalysisReportV1,
 }
 
@@ -756,6 +804,10 @@ pub fn confidence_calibration(samples: &[(f64, bool)]) -> ConfidenceCalibrationV
         abstentions_excluded: 0,
         invalid_excluded: 0,
         retries_excluded: 0,
+        invalidated_cases_excluded: 0,
+        missing_outcomes_excluded: 0,
+        unscored_candidates_excluded: 0,
+        integrity_failures_excluded: 0,
         bins,
     }
 }
