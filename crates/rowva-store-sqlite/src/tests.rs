@@ -42,12 +42,15 @@ fn field(app: &mut SqliteApplication, object_id: &ObjectId, kind: FieldKind) -> 
 #[test]
 fn initializes_migrates_reopens_and_migrations_are_idempotent() {
     let (_dir, path, app) = setup();
-    assert_eq!(app.migration_versions().unwrap(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(app.migration_versions().unwrap(), vec![1, 2, 3, 4, 5, 6]);
     let id = app.workspace_id().clone();
     drop(app);
     let reopened = SqliteApplication::open(&path).unwrap();
     assert_eq!(reopened.workspace_id(), &id);
-    assert_eq!(reopened.migration_versions().unwrap(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        reopened.migration_versions().unwrap(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
 }
 
 #[test]
@@ -732,6 +735,9 @@ fn exported_bundle_is_exactly_digestible_and_corruption_is_detected() {
         export.bundle_digest
     );
     app.conn
+        .execute_batch("DROP TRIGGER _rowva_eval_cases_frozen_no_update")
+        .unwrap();
+    app.conn
         .execute(
             "UPDATE _rowva_evaluation_cases SET record_snapshot_json='{}' WHERE id=?1",
             [case.id.as_str()],
@@ -868,6 +874,9 @@ fn replay_rejects_corrupted_candidate_fingerprint() {
         })
         .unwrap();
     app.conn
+        .execute_batch("DROP TRIGGER _rowva_eval_candidates_no_update")
+        .unwrap();
+    app.conn
         .execute(
             "UPDATE _rowva_evaluation_candidates SET fingerprint='corrupted' WHERE id=?1",
             [candidate.id.as_str()],
@@ -991,6 +1000,9 @@ fn corrupted_candidate_rolls_back_outcome_and_results() {
         .submit_evaluation_candidate(no_change_candidate(&case, "corrupted"))
         .unwrap();
     app.conn
+        .execute_batch("DROP TRIGGER _rowva_eval_candidates_no_update")
+        .unwrap();
+    app.conn
         .execute(
             "UPDATE _rowva_evaluation_candidates SET actor_version='tampered' WHERE id=?1",
             [candidate.id.as_str()],
@@ -1101,7 +1113,7 @@ fn human_reference_requires_exact_revision_and_stage_only_command() {
         },
     );
     assert!(
-        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:without_revision.operation_id}),Err(RowvaError::Validation{code,..}) if code=="human_operation_revision_required")
+        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:without_revision.operation_id}),Err(RowvaError::Validation{code,..}) if code=="evaluation_human_outcome_integrity_mismatch")
     );
 
     let (_dir, _path, mut app) = setup();
@@ -1138,6 +1150,536 @@ fn human_reference_requires_exact_revision_and_stage_only_command() {
         },
     );
     assert!(
-        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:extra.operation_id}),Err(RowvaError::Validation{code,..}) if code=="human_operation_target_mismatch"||code=="human_operation_extra_changes")
+        matches!(app.record_evaluation_outcome(&case.id,HumanEvaluationOutcomeInput::CommittedOperation{operation_id:extra.operation_id}),Err(RowvaError::Validation{code,..}) if code=="evaluation_human_outcome_integrity_mismatch")
+    );
+}
+
+#[test]
+fn immutable_dataset_analysis_and_terminal_invalidation_are_durable() {
+    let (_dir, path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let agent = eval_agent("quality-v1");
+    let first_candidate = app
+        .submit_evaluation_candidate(CandidateImport {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            bundle_digest: case.bundle_digest.clone(),
+            actor: agent.clone(),
+            decision: ShadowDecision::NoChange {
+                reason: Some("SYNTHETIC_PRIVATE_REASON".into()),
+            },
+            reason: None,
+            confidence: Some(0.8),
+        })
+        .unwrap();
+    app.submit_evaluation_candidate(CandidateImport {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        bundle_digest: case.bundle_digest.clone(),
+        actor: agent.clone(),
+        decision: ShadowDecision::NoChange { reason: None },
+        reason: Some("retry evidence".into()),
+        confidence: Some(0.7),
+    })
+    .unwrap();
+    app.record_evaluation_outcome(
+        &case.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: Some("synthetic reference".into()),
+        },
+    )
+    .unwrap();
+    let duplicate = eval_case(&mut app, &object, &stage, &record);
+    app.submit_evaluation_candidate(CandidateImport {
+        protocol_version: 1,
+        case_id: duplicate.id.clone(),
+        bundle_digest: duplicate.bundle_digest.clone(),
+        actor: agent.clone(),
+        decision: ShadowDecision::NoChange { reason: None },
+        reason: None,
+        confidence: Some(0.8),
+    })
+    .unwrap();
+    app.record_evaluation_outcome(
+        &duplicate.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: None,
+        },
+    )
+    .unwrap();
+    let dataset = app
+        .create_evaluation_dataset(EvaluationDatasetCreateV1 {
+            protocol_version: 1,
+            name: "Synthetic quality set".into(),
+            description: None,
+            selection: EvaluationDatasetSelectionV1::Explicit {
+                case_ids: vec![case.id.clone(), duplicate.id.clone()],
+            },
+            creator: ActorContext::local_user(),
+        })
+        .unwrap();
+    assert_eq!(dataset.manifest.case_members.len(), 2);
+    assert!(app.conn.execute("INSERT INTO _rowva_evaluation_dataset_cases(dataset_id,case_id,position,case_bundle_digest,status_at_snapshot,case_created_at,human_outcome_present,scorer_revisions_json) VALUES(?1,?2,99,'x','scored','x',1,'[]')",params![dataset.manifest.dataset_id.as_str(),case.id.as_str()]).is_err());
+    assert!(app
+        .conn
+        .execute(
+            "UPDATE _rowva_evaluation_cases SET bundle_digest='tampered' WHERE id=?1",
+            [case.id.as_str()]
+        )
+        .is_err());
+    assert!(app
+        .conn
+        .execute(
+            "UPDATE _rowva_evaluation_datasets SET created_at=created_at WHERE id=?1",
+            [dataset.manifest.dataset_id.as_str()]
+        )
+        .is_err());
+    assert!(app
+        .conn
+        .execute(
+            "DELETE FROM _rowva_evaluation_dataset_cases WHERE dataset_id=?1",
+            [dataset.manifest.dataset_id.as_str()]
+        )
+        .is_err());
+    let request = EvaluationAnalysisRequestV1 {
+        protocol_version: 1,
+        dataset_id: dataset.manifest.dataset_id.clone(),
+        actor_id: agent.id.clone(),
+        actor_version: "quality-v1".into(),
+        scorer_revision: 1,
+        readiness_rubric_revision: 1,
+        quality_revision: 1,
+        calibration_revision: 1,
+    };
+    let first = app.run_evaluation_analysis(request.clone()).unwrap();
+    assert!(app
+        .conn
+        .execute(
+            "DELETE FROM _rowva_evaluation_analysis_runs WHERE id=?1",
+            [first.id.as_str()]
+        )
+        .is_err());
+    assert_eq!(
+        first.report.included_case_ids,
+        vec![case.id.clone(), duplicate.id.clone()]
+    );
+    assert_eq!(first.report.quality.duplicate_content_groups.len(), 1);
+    assert_eq!(first.report.quality.repeated_evidence_groups.len(), 1);
+    assert_eq!(first.report.metrics.counts.ineligible_retries, 1);
+    assert_eq!(first.report.metrics.counts.total_submitted_attempts, 3);
+    assert_eq!(first.evidence.cases[0].retry_candidates.len(), 1);
+    assert!(app
+        .conn
+        .execute(
+            "UPDATE _rowva_evaluation_candidates SET reason=reason WHERE id=?1",
+            [first_candidate.id.as_str()]
+        )
+        .is_err());
+    assert!(app
+        .conn
+        .execute(
+            "UPDATE _rowva_evaluation_human_outcomes SET recorded_at=recorded_at WHERE case_id=?1",
+            [case.id.as_str()]
+        )
+        .is_err());
+    assert!(app
+        .conn
+        .execute(
+            "DELETE FROM _rowva_evaluation_results WHERE candidate_id=?1",
+            [first_candidate.id.as_str()]
+        )
+        .is_err());
+    assert_eq!(
+        app.run_evaluation_analysis(request.clone()).unwrap().id,
+        first.id
+    );
+    let metadata = app
+        .export_evaluation_dataset(
+            &dataset.manifest.dataset_id,
+            EvaluationExportProfile::Metadata,
+        )
+        .unwrap();
+    let encoded = serde_json::to_string(&metadata).unwrap();
+    assert!(!encoded.contains("SYNTHETIC_PRIVATE_REASON"));
+    assert!(!metadata.payload.contains_sensitive_values);
+    assert_eq!(
+        sha256_digest(&metadata.payload).unwrap(),
+        metadata.export_digest
+    );
+    let full = app
+        .export_evaluation_dataset(
+            &dataset.manifest.dataset_id,
+            EvaluationExportProfile::FullLocal,
+        )
+        .unwrap();
+    assert!(full.payload.contains_sensitive_values);
+    let invalidation = app
+        .invalidate_evaluation_case(EvaluationInvalidationInput {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            category: EvaluationInvalidationCategory::IncorrectInput,
+            reason: "synthetic contamination".into(),
+            actor: ActorContext::local_user(),
+            related_case_id: None,
+        })
+        .unwrap();
+    assert_eq!(invalidation.previous_status, EvaluationCaseStatus::Scored);
+    assert_eq!(app.get_evaluation_analysis(&first.id).unwrap(), first);
+    let second = app.run_evaluation_analysis(request).unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.report.included_case_ids, vec![duplicate.id.clone()]);
+    assert_eq!(
+        second
+            .report
+            .excluded_cases
+            .get(&case.id)
+            .map(String::as_str),
+        Some("invalidated")
+    );
+    let current_report = app.evaluation_report().unwrap();
+    assert_eq!(current_report.len(), 1);
+    assert_eq!(current_report[0].counts.cases_available, 1);
+    assert_eq!(current_report[0].counts.scored_eligible, 1);
+    drop(app);
+    let reopened = SqliteApplication::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_evaluation_dataset(&dataset.manifest.dataset_id)
+            .unwrap()
+            .dataset_digest,
+        dataset.dataset_digest
+    );
+    reopened
+        .conn
+        .execute_batch("DROP TRIGGER _rowva_eval_dataset_cases_no_update")
+        .unwrap();
+    reopened.conn.execute("UPDATE _rowva_evaluation_dataset_cases SET case_bundle_digest='corrupted' WHERE dataset_id=?1 AND position=0",[dataset.manifest.dataset_id.as_str()]).unwrap();
+    assert!(
+        matches!(reopened.get_evaluation_dataset(&dataset.manifest.dataset_id),Err(RowvaError::Validation{code,..}) if code=="evaluation_dataset_integrity_mismatch")
+    );
+}
+
+#[test]
+fn corrupted_human_outcome_aborts_analysis_without_partial_persistence() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let agent = eval_agent("integrity-v1");
+    app.submit_evaluation_candidate(CandidateImport {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        bundle_digest: case.bundle_digest.clone(),
+        actor: agent.clone(),
+        decision: ShadowDecision::NoChange { reason: None },
+        reason: None,
+        confidence: Some(0.5),
+    })
+    .unwrap();
+    app.record_evaluation_outcome(
+        &case.id,
+        HumanEvaluationOutcomeInput::NoChange {
+            actor: ActorContext::local_user(),
+            reason: Some("reference".into()),
+        },
+    )
+    .unwrap();
+    let dataset = app
+        .create_evaluation_dataset(EvaluationDatasetCreateV1 {
+            protocol_version: 1,
+            name: "Outcome integrity".into(),
+            description: None,
+            selection: EvaluationDatasetSelectionV1::Explicit {
+                case_ids: vec![case.id.clone()],
+            },
+            creator: ActorContext::local_user(),
+        })
+        .unwrap();
+    app.conn
+        .execute_batch("DROP TRIGGER _rowva_eval_outcomes_no_update")
+        .unwrap();
+    app.conn
+        .execute(
+            "UPDATE _rowva_evaluation_human_outcomes SET normalized_stage_json='\"Qualified\"' WHERE case_id=?1",
+            [case.id.as_str()],
+        )
+        .unwrap();
+    let request = EvaluationAnalysisRequestV1 {
+        protocol_version: 1,
+        dataset_id: dataset.manifest.dataset_id,
+        actor_id: agent.id,
+        actor_version: "integrity-v1".into(),
+        scorer_revision: 1,
+        readiness_rubric_revision: 1,
+        quality_revision: 1,
+        calibration_revision: 1,
+    };
+    assert!(
+        matches!(app.run_evaluation_analysis(request),Err(RowvaError::Validation{code,..}) if code=="evaluation_human_outcome_integrity_mismatch")
+    );
+    let analyses: i64 = app
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_analysis_runs",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(analyses, 0);
+}
+
+#[test]
+fn corrupted_linked_operation_aborts_analysis_and_preserves_existing_results() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let agent = eval_agent("operation-integrity-v1");
+    let candidate = app
+        .submit_evaluation_candidate(CandidateImport {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            bundle_digest: case.bundle_digest.clone(),
+            actor: agent.clone(),
+            decision: ShadowDecision::NoChange { reason: None },
+            reason: None,
+            confidence: Some(0.5),
+        })
+        .unwrap();
+    let mut values = HashMap::new();
+    values.insert(stage, json!("Qualified"));
+    let operation = commit(
+        &mut app,
+        Command::UpdateRecord {
+            object_id: object,
+            record_id: record,
+            values,
+            expected_revision: Some(case.base_record_revision),
+        },
+    );
+    app.record_evaluation_outcome(
+        &case.id,
+        HumanEvaluationOutcomeInput::CommittedOperation {
+            operation_id: operation.operation_id.clone(),
+        },
+    )
+    .unwrap();
+    let dataset = app
+        .create_evaluation_dataset(EvaluationDatasetCreateV1 {
+            protocol_version: 1,
+            name: "Operation integrity".into(),
+            description: None,
+            selection: EvaluationDatasetSelectionV1::Explicit {
+                case_ids: vec![case.id],
+            },
+            creator: ActorContext::local_user(),
+        })
+        .unwrap();
+    let results_before: i64 = app
+        .conn
+        .query_row("SELECT COUNT(*) FROM _rowva_evaluation_results", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    app.conn
+        .execute(
+            "UPDATE _rowva_operations SET request_json='{}' WHERE id=?1",
+            [operation.operation_id.as_str()],
+        )
+        .unwrap();
+    let request = EvaluationAnalysisRequestV1 {
+        protocol_version: 1,
+        dataset_id: dataset.manifest.dataset_id,
+        actor_id: agent.id,
+        actor_version: "operation-integrity-v1".into(),
+        scorer_revision: 1,
+        readiness_rubric_revision: 1,
+        quality_revision: 1,
+        calibration_revision: 1,
+    };
+    assert!(
+        matches!(app.run_evaluation_analysis(request),Err(RowvaError::Validation{code,..}) if code=="evaluation_human_outcome_integrity_mismatch")
+    );
+    let analyses: i64 = app
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_analysis_runs",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let results_after: i64 = app
+        .conn
+        .query_row("SELECT COUNT(*) FROM _rowva_evaluation_results", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(analyses, 0);
+    assert_eq!(results_after, results_before);
+    let candidate_count: i64 = app
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM _rowva_evaluation_candidates WHERE id=?1",
+            [candidate.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(candidate_count, 1);
+}
+
+#[test]
+fn same_false_negative_verdict_preserves_distinct_human_destination_evidence() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, first_record) = evaluation_setup(&mut app);
+    let mut second_values = HashMap::new();
+    second_values.insert(stage.clone(), json!("Discovery"));
+    let second_created = commit(
+        &mut app,
+        Command::CreateRecord {
+            object_id: object.clone(),
+            record_id: None,
+            values: second_values,
+        },
+    );
+    let second_record = RecordId::from_string(
+        second_created.result.unwrap()["record_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let agent = eval_agent("destination-v1");
+    let mut runs = Vec::new();
+    for (record, destination) in [(first_record, "Qualified"), (second_record, "Negotiation")] {
+        let case = eval_case(&mut app, &object, &stage, &record);
+        app.submit_evaluation_candidate(CandidateImport {
+            protocol_version: 1,
+            case_id: case.id.clone(),
+            bundle_digest: case.bundle_digest.clone(),
+            actor: agent.clone(),
+            decision: ShadowDecision::NoChange { reason: None },
+            reason: None,
+            confidence: Some(0.5),
+        })
+        .unwrap();
+        let mut values = HashMap::new();
+        values.insert(stage.clone(), json!(destination));
+        let operation = commit(
+            &mut app,
+            Command::UpdateRecord {
+                object_id: object.clone(),
+                record_id: record,
+                values,
+                expected_revision: Some(case.base_record_revision),
+            },
+        );
+        app.record_evaluation_outcome(
+            &case.id,
+            HumanEvaluationOutcomeInput::CommittedOperation {
+                operation_id: operation.operation_id,
+            },
+        )
+        .unwrap();
+        let dataset = app
+            .create_evaluation_dataset(EvaluationDatasetCreateV1 {
+                protocol_version: 1,
+                name: format!("Destination {destination}"),
+                description: None,
+                selection: EvaluationDatasetSelectionV1::Explicit {
+                    case_ids: vec![case.id],
+                },
+                creator: ActorContext::local_user(),
+            })
+            .unwrap();
+        runs.push(
+            app.run_evaluation_analysis(EvaluationAnalysisRequestV1 {
+                protocol_version: 1,
+                dataset_id: dataset.manifest.dataset_id,
+                actor_id: agent.id.clone(),
+                actor_version: "destination-v1".into(),
+                scorer_revision: 1,
+                readiness_rubric_revision: 1,
+                quality_revision: 1,
+                calibration_revision: 1,
+            })
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        runs[0].evidence.cases[0]
+            .scorer_result
+            .as_ref()
+            .unwrap()
+            .verdict,
+        EvaluationVerdict::FalseNegative
+    );
+    assert_eq!(
+        runs[1].evidence.cases[0]
+            .scorer_result
+            .as_ref()
+            .unwrap()
+            .verdict,
+        EvaluationVerdict::FalseNegative
+    );
+    assert_eq!(
+        runs[0].evidence.cases[0]
+            .human_outcome
+            .as_ref()
+            .unwrap()
+            .normalized_stage,
+        json!("Qualified")
+    );
+    assert_eq!(
+        runs[1].evidence.cases[0]
+            .human_outcome
+            .as_ref()
+            .unwrap()
+            .normalized_stage,
+        json!("Negotiation")
+    );
+    assert_ne!(runs[0].analysis_input_digest, runs[1].analysis_input_digest);
+    assert_ne!(runs[0].id, runs[1].id);
+}
+
+#[test]
+fn collecting_invalidation_closes_candidate_and_outcome_paths() {
+    let (_dir, _path, mut app) = setup();
+    let (object, stage, record) = evaluation_setup(&mut app);
+    let case = eval_case(&mut app, &object, &stage, &record);
+    let denied = app.invalidate_evaluation_case(EvaluationInvalidationInput {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        category: EvaluationInvalidationCategory::Other,
+        reason: "agent cannot decide this".into(),
+        actor: eval_agent("1"),
+        related_case_id: None,
+    });
+    assert!(
+        matches!(denied,Err(RowvaError::PermissionDenied{code,..}) if code=="evaluation_invalidation_actor_denied")
+    );
+    app.invalidate_evaluation_case(EvaluationInvalidationInput {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        category: EvaluationInvalidationCategory::PrivacyOrRetentionRequest,
+        reason: "remove from active evaluation".into(),
+        actor: ActorContext::local_user(),
+        related_case_id: None,
+    })
+    .unwrap();
+    assert!(app
+        .submit_evaluation_candidate(no_change_candidate(&case, "after"))
+        .is_err());
+    assert!(app
+        .record_evaluation_outcome(
+            &case.id,
+            HumanEvaluationOutcomeInput::NoChange {
+                actor: ActorContext::local_user(),
+                reason: None
+            }
+        )
+        .is_err());
+    assert_eq!(
+        app.get_evaluation_case(&case.id).unwrap().status,
+        EvaluationCaseStatus::Invalidated
     );
 }

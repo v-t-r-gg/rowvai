@@ -20,6 +20,8 @@ RowvAI is an early local-first, model-neutral CRM runtime for humans and autonom
 
 The desktop includes an Agent Activity inbox for governed changes. Shadow evaluation remains developer-facing and cannot alter authority. See [shadow evaluation](docs/shadow-evaluation.md), [approvals](docs/approvals.md), [undo](docs/undo.md), [MCP usage](docs/mcp.md), [architecture](docs/architecture.md), and the [threat model](docs/security/mcp-threat-model.md).
 
+Evaluation operators can terminally invalidate contaminated cases, snapshot immutable datasets, run reproducible actor-version analyses, inspect sampling and confidence-calibration diagnostics, and export metadata without CRM values. See [evaluation dataset quality](docs/evaluation-data-quality.md). These controls are advisory only.
+
 ## Development
 
 ```bash
@@ -27,6 +29,7 @@ npm install
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo run -p rowva-eval -- fixture run fixtures/shadow/deal_stage_cases.json --json
+cargo run -p rowva-eval -- fixture quality-run fixtures/quality/deal_stage_quality_cases.json --json
 npm run build
 npm run tauri dev
 ./target/debug/rowva-mcp --help

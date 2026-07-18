@@ -37,6 +37,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "shadow-evaluation-v1",
         include_str!("../migrations/0005_shadow_evaluation.sql"),
     ),
+    (
+        6,
+        "evaluation-data-quality-v1",
+        include_str!("../migrations/0006_evaluation_data_quality.sql"),
+    ),
 ];
 
 pub struct SqliteApplication {
@@ -1305,6 +1310,13 @@ impl EvaluationApplication for SqliteApplication {
                 "candidate does not bind the sealed case bundle",
             ));
         }
+        if case.status == EvaluationCaseStatus::Invalidated {
+            return Err(RowvaError::Conflict {
+                code: "evaluation_case_invalidated".into(),
+                message: "invalidated evaluation cases cannot accept candidates".into(),
+                details: None,
+            });
+        }
         if case.status != EvaluationCaseStatus::CollectingCandidates {
             return Err(RowvaError::Conflict {
                 code: "evaluation_collection_closed".into(),
@@ -1388,6 +1400,13 @@ impl EvaluationApplication for SqliteApplication {
         }
         let case = load_evaluation_case(&tx, id)?;
         verify_case_integrity(&case)?;
+        if case.status == EvaluationCaseStatus::Invalidated {
+            return Err(RowvaError::Conflict {
+                code: "evaluation_case_invalidated".into(),
+                message: "invalidated evaluation cases cannot accept outcomes".into(),
+                details: None,
+            });
+        }
         if case.status != EvaluationCaseStatus::CollectingCandidates {
             return Err(RowvaError::Conflict {
                 code: "evaluation_outcome_already_recorded".into(),
@@ -1395,102 +1414,8 @@ impl EvaluationApplication for SqliteApplication {
                 details: None,
             });
         }
-        let human_stage = match &input {
-            HumanEvaluationOutcomeInput::NoChange { actor, reason } => {
-                if actor.actor_type != ActorType::Human {
-                    return Err(RowvaError::validation(
-                        "human_outcome_required",
-                        "no-change outcome requires a human actor",
-                    ));
-                }
-                if reason.as_ref().is_some_and(|v| v.len() > 4096) {
-                    return Err(RowvaError::validation(
-                        "reason_too_long",
-                        "outcome reason exceeds 4096 bytes",
-                    ));
-                }
-                case.current_stage.clone()
-            }
-            HumanEvaluationOutcomeInput::CommittedOperation { operation_id } => {
-                let operation = load_operation_evidence(&tx, operation_id)?;
-                if operation.status != OperationStatus::Committed
-                    || operation.actor.actor_type != ActorType::Human
-                {
-                    return Err(RowvaError::validation(
-                        "invalid_human_operation",
-                        "outcome must link a committed human operation",
-                    ));
-                }
-                if operation.base_schema_revision != case.base_schema_revision {
-                    return Err(RowvaError::validation(
-                        "human_operation_schema_mismatch",
-                        "operation schema revision does not match the frozen case",
-                    ));
-                }
-                let request: OperationRequest = serde_json::from_value(operation.request.clone())
-                    .map_err(|_| {
-                    RowvaError::validation(
-                        "invalid_human_operation_request",
-                        "stored operation request cannot be verified",
-                    )
-                })?;
-                match &request.command {
-                    Command::UpdateRecord {
-                        object_id,
-                        record_id,
-                        values,
-                        expected_revision: Some(revision),
-                    } if object_id == &case.target_object_id
-                        && record_id == &case.target_record_id
-                        && revision == &case.base_record_revision
-                        && values.len() == 1
-                        && values.contains_key(&case.target_stage_field.id) => {}
-                    Command::UpdateRecord {
-                        expected_revision: None,
-                        ..
-                    } => {
-                        return Err(RowvaError::validation(
-                            "human_operation_revision_required",
-                            "reference operation must include the frozen expected revision",
-                        ))
-                    }
-                    _ => return Err(RowvaError::validation(
-                        "human_operation_target_mismatch",
-                        "reference operation must be a stage-only update against the frozen target",
-                    )),
-                }
-                if operation.changes.len() != 1 {
-                    return Err(RowvaError::validation(
-                        "human_operation_extra_changes",
-                        "reference operation must change only the evaluated stage",
-                    ));
-                }
-                let change = &operation.changes[0];
-                if change.object_id != case.target_object_id
-                    || change.record_id.as_ref() != Some(&case.target_record_id)
-                    || change.field_id.as_ref() != Some(&case.target_stage_field.id)
-                {
-                    return Err(RowvaError::validation(
-                        "human_operation_target_mismatch",
-                        "operation does not change the evaluated stage",
-                    ));
-                }
-                if change.before.as_ref() != Some(&case.current_stage) {
-                    return Err(RowvaError::validation(
-                        "human_operation_base_mismatch",
-                        "human operation is incompatible with the frozen stage",
-                    ));
-                }
-                let after = change.after.clone().unwrap_or(Value::Null);
-                if !field_value_is_valid(&case.target_stage_field, &after) {
-                    return Err(RowvaError::validation(
-                        "human_operation_invalid_stage",
-                        "operation result is invalid for the frozen stage field",
-                    ));
-                }
-                after
-            }
-        };
+        let verified_outcome = verify_and_normalize_human_outcome(&tx, &case, &input, None)?;
+        let human_stage = verified_outcome.normalized_stage.clone();
         let transitioned = tx
             .execute(
                 "UPDATE _rowva_evaluation_cases SET status='outcome_recorded' WHERE id=?1 AND status='collecting_candidates'",
@@ -1562,7 +1487,7 @@ impl EvaluationApplication for SqliteApplication {
                 |r| r.get::<_, i64>(0),
             )
             .map_err(storage)? as u64;
-        let mut stmt=self.conn.prepare("SELECT c.actor_id,c.actor_version,c.case_id,c.eligible_for_metrics,c.validation_status,c.eligibility_reason,r.verdict FROM _rowva_evaluation_candidates c LEFT JOIN _rowva_evaluation_results r ON r.candidate_id=c.id ORDER BY c.actor_id,c.actor_version,c.submitted_at,c.id").map_err(storage)?;
+        let mut stmt=self.conn.prepare("SELECT c.actor_id,c.actor_version,c.case_id,c.eligible_for_metrics,c.validation_status,c.eligibility_reason,r.verdict FROM _rowva_evaluation_candidates c JOIN _rowva_evaluation_cases ec ON ec.id=c.case_id LEFT JOIN _rowva_evaluation_results r ON r.candidate_id=c.id WHERE ec.status!='invalidated' ORDER BY c.actor_id,c.actor_version,c.submitted_at,c.id").map_err(storage)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -1663,6 +1588,1110 @@ impl EvaluationApplication for SqliteApplication {
         });
         Ok(metrics)
     }
+
+    fn invalidate_evaluation_case(
+        &mut self,
+        input: EvaluationInvalidationInput,
+    ) -> Result<EvaluationInvalidation, RowvaError> {
+        if input.protocol_version != EVALUATION_DATASET_PROTOCOL_VERSION
+            || input.reason.is_empty()
+            || input.reason.len() > MAX_REASON_BYTES
+        {
+            return Err(RowvaError::validation(
+                "invalid_evaluation_invalidation",
+                "invalidation protocol or reason is invalid",
+            ));
+        }
+        let actor = validate_evaluation_actor(&input.actor, false)?;
+        if !matches!(actor.actor_type, ActorType::Human | ActorType::System) {
+            return Err(RowvaError::PermissionDenied {
+                code: "evaluation_invalidation_actor_denied".into(),
+                message: "only human or system actors may invalidate evaluation cases".into(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let case = load_evaluation_case(&tx, &input.case_id)?;
+        verify_case_integrity(&case)?;
+        if case.status == EvaluationCaseStatus::Invalidated {
+            return Err(RowvaError::Conflict {
+                code: "evaluation_case_invalidated".into(),
+                message: "evaluation case is already invalidated".into(),
+                details: None,
+            });
+        }
+        if let Some(related) = &input.related_case_id {
+            verify_case_integrity(&load_evaluation_case(&tx, related)?)?;
+        }
+        let now = Utc::now();
+        let record = EvaluationInvalidation {
+            id: EvaluationInvalidationId::new(),
+            case_id: input.case_id,
+            category: input.category,
+            reason: input.reason,
+            actor,
+            previous_status: case.status,
+            invalidated_at: now,
+            case_bundle_digest: case.bundle_digest,
+            related_case_id: input.related_case_id,
+            protocol_version: input.protocol_version,
+        };
+        upsert_actor(&tx, &record.actor, &now.to_rfc3339())?;
+        tx.execute("INSERT INTO _rowva_evaluation_invalidations(id,case_id,category,reason,actor_id,actor_json,previous_status,invalidated_at,case_bundle_digest,related_case_id,protocol_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.id.as_str(),record.case_id.as_str(),enum_json_name(&record.category)?,record.reason,record.actor.id.as_str(),serde_json::to_string(&record.actor).map_err(internal)?,enum_json_name(&record.previous_status)?,record.invalidated_at.to_rfc3339(),record.case_bundle_digest,record.related_case_id.as_ref().map(EvaluationCaseId::as_str),record.protocol_version]).map_err(storage)?;
+        tx.execute("UPDATE _rowva_evaluation_cases SET status='invalidated',invalidated_at=?2,invalidation_reason=?3 WHERE id=?1 AND status!='invalidated'",params![record.case_id.as_str(),now.to_rfc3339(),record.reason]).map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    fn list_evaluation_cases(&self) -> Result<Vec<EvaluationCase>, RowvaError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM _rowva_evaluation_cases ORDER BY created_at,id")
+            .map_err(storage)?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        ids.into_iter()
+            .map(|id| load_evaluation_case(&self.conn, &EvaluationCaseId::from_string(id)?))
+            .collect()
+    }
+
+    fn create_evaluation_dataset(
+        &mut self,
+        input: EvaluationDatasetCreateV1,
+    ) -> Result<EvaluationDataset, RowvaError> {
+        if input.protocol_version != 1
+            || input.name.trim().is_empty()
+            || input.name.len() > MAX_DATASET_NAME_BYTES
+            || input
+                .description
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_DATASET_DESCRIPTION_BYTES)
+        {
+            return Err(RowvaError::validation(
+                "invalid_evaluation_dataset",
+                "dataset name, description, or protocol is invalid",
+            ));
+        }
+        let creator = validate_evaluation_actor(&input.creator, false)?;
+        if !matches!(creator.actor_type, ActorType::Human | ActorType::System) {
+            return Err(RowvaError::PermissionDenied {
+                code: "evaluation_dataset_actor_denied".into(),
+                message: "only human or system actors may create datasets".into(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let ids: Vec<String> = match &input.selection {
+            EvaluationDatasetSelectionV1::Explicit { case_ids } => {
+                if case_ids.is_empty() || case_ids.len() > MAX_DATASET_CASES {
+                    return Err(RowvaError::validation(
+                        "invalid_dataset_size",
+                        "dataset must contain between 1 and 10000 cases",
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for id in case_ids {
+                    if !seen.insert(id.as_str()) {
+                        return Err(RowvaError::validation(
+                            "duplicate_dataset_case",
+                            "dataset case IDs must be unique",
+                        ));
+                    }
+                }
+                case_ids.iter().map(ToString::to_string).collect()
+            }
+            EvaluationDatasetSelectionV1::AllScored {
+                created_at_or_after,
+                created_before,
+            } => {
+                let mut stmt=tx.prepare("SELECT id FROM _rowva_evaluation_cases WHERE status='scored' AND (?1 IS NULL OR created_at>=?1) AND (?2 IS NULL OR created_at<?2) ORDER BY created_at,id LIMIT 10001").map_err(storage)?;
+                let resolved = stmt
+                    .query_map(
+                        params![
+                            created_at_or_after.map(|v| v.to_rfc3339()),
+                            created_before.map(|v| v.to_rfc3339())
+                        ],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(storage)?;
+                resolved
+            }
+        };
+        if ids.is_empty() || ids.len() > MAX_DATASET_CASES {
+            return Err(RowvaError::validation(
+                "invalid_dataset_size",
+                "resolved dataset must contain between 1 and 10000 cases",
+            ));
+        }
+        let mut members = Vec::with_capacity(ids.len());
+        for (position, id) in ids.iter().enumerate() {
+            let case = load_evaluation_case(&tx, &EvaluationCaseId::from_string(id)?)?;
+            verify_case_integrity(&case)?;
+            if case.status != EvaluationCaseStatus::Scored {
+                return Err(RowvaError::validation(
+                    "dataset_case_not_eligible",
+                    "datasets require scored, non-invalidated cases",
+                ));
+            }
+            let outcome:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM _rowva_evaluation_human_outcomes WHERE case_id=?1)",[id],|r|r.get(0)).map_err(storage)?;
+            let mut s=tx.prepare("SELECT DISTINCT scorer_revision FROM _rowva_evaluation_results WHERE case_id=?1 ORDER BY scorer_revision").map_err(storage)?;
+            let revisions = s
+                .query_map([id], |r| r.get::<_, u16>(0))
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            members.push(EvaluationDatasetCaseMemberV1 {
+                case_id: case.id,
+                case_bundle_digest: case.bundle_digest,
+                status_at_snapshot: case.status,
+                case_created_at: case.created_at,
+                human_outcome_present: outcome,
+                scorer_revisions: revisions,
+                position: position as u32,
+            });
+        }
+        let now = Utc::now();
+        let manifest = EvaluationDatasetManifestV1 {
+            protocol_version: 1,
+            dataset_id: EvaluationDatasetId::new(),
+            name: input.name,
+            description: input.description,
+            workflow: EvaluationWorkflow::DealStageQualificationV1,
+            workflow_version: 1,
+            selection: input.selection,
+            case_members: members,
+            creator,
+            created_at: now,
+        };
+        let dataset = EvaluationDataset {
+            dataset_digest: evaluation_dataset_digest(&manifest)?,
+            manifest,
+        };
+        upsert_actor(&tx, &dataset.manifest.creator, &now.to_rfc3339())?;
+        tx.execute("INSERT INTO _rowva_evaluation_datasets(id,manifest_json,dataset_digest,workflow,workflow_version,creator_actor_id,created_at,status) VALUES(?1,?2,?3,'deal_stage_qualification_v1',1,?4,?5,'building')",params![dataset.manifest.dataset_id.as_str(),serde_json::to_string(&dataset.manifest).map_err(internal)?,dataset.dataset_digest,dataset.manifest.creator.id.as_str(),now.to_rfc3339()]).map_err(constraint)?;
+        for m in &dataset.manifest.case_members {
+            tx.execute("INSERT INTO _rowva_evaluation_dataset_cases(dataset_id,case_id,position,case_bundle_digest,status_at_snapshot,case_created_at,human_outcome_present,scorer_revisions_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![dataset.manifest.dataset_id.as_str(),m.case_id.as_str(),m.position,m.case_bundle_digest,enum_json_name(&m.status_at_snapshot)?,m.case_created_at.to_rfc3339(),m.human_outcome_present,serde_json::to_string(&m.scorer_revisions).map_err(internal)?]).map_err(storage)?;
+        }
+        verify_dataset_membership(&tx, &dataset)?;
+        if tx.execute("UPDATE _rowva_evaluation_datasets SET status='sealed' WHERE id=?1 AND status='building'",[dataset.manifest.dataset_id.as_str()]).map_err(storage)?!=1{return Err(RowvaError::validation("evaluation_dataset_integrity_mismatch","dataset could not be sealed"));}
+        tx.commit().map_err(storage)?;
+        Ok(dataset)
+    }
+
+    fn get_evaluation_dataset(
+        &self,
+        id: &EvaluationDatasetId,
+    ) -> Result<EvaluationDataset, RowvaError> {
+        load_dataset(&self.conn, id)
+    }
+    fn list_evaluation_datasets(&self) -> Result<Vec<EvaluationDataset>, RowvaError> {
+        let mut s = self
+            .conn
+            .prepare("SELECT id FROM _rowva_evaluation_datasets ORDER BY created_at,id")
+            .map_err(storage)?;
+        let ids = s
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        ids.into_iter()
+            .map(|v| self.get_evaluation_dataset(&EvaluationDatasetId::from_string(v)?))
+            .collect()
+    }
+
+    fn run_evaluation_analysis(
+        &mut self,
+        input: EvaluationAnalysisRequestV1,
+    ) -> Result<EvaluationAnalysisRun, RowvaError> {
+        if input.protocol_version != 1
+            || input.quality_revision != 1
+            || input.calibration_revision != 1
+        {
+            return Err(RowvaError::validation(
+                "unsupported_evaluation_analysis_revision",
+                "unsupported quality or calibration revision",
+            ));
+        }
+        validate_scorer_revision(input.scorer_revision)?;
+        validate_readiness_revision(input.readiness_rubric_revision)?;
+        let dataset = self.get_evaluation_dataset(&input.dataset_id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let mut included = Vec::new();
+        let mut excluded = HashMap::new();
+        let mut counts = EvaluationCounts {
+            cases_available: dataset.manifest.case_members.len() as u64,
+            ..Default::default()
+        };
+        let mut calibration_samples = Vec::new();
+        let mut quality = EvaluationQualityReportV1 {
+            revision: 1,
+            dataset_members: counts.cases_available,
+            ..Default::default()
+        };
+        let mut evidence = Vec::<EvaluationAnalysisCaseEvidenceV1>::new();
+        let mut content_groups: HashMap<String, Vec<EvaluationCaseId>> = HashMap::new();
+        let mut evidence_groups: HashMap<String, Vec<EvaluationCaseId>> = HashMap::new();
+        let mut meeting_groups: HashMap<String, Vec<EvaluationCaseId>> = HashMap::new();
+        let mut target_groups: HashMap<String, Vec<EvaluationCaseId>> = HashMap::new();
+        for member in &dataset.manifest.case_members {
+            let case = load_evaluation_case(&tx, &member.case_id)?;
+            verify_case_integrity(&case)?;
+            let content_identity_digest = evaluation_case_content_digest(&case.bundle)?;
+            let target_revision_identity = format!(
+                "{}:{}:{}",
+                case.target_record_id, case.base_record_revision.0, case.target_stage_field.id
+            );
+            let candidates = load_candidates(&tx, &member.case_id)?;
+            for candidate in &candidates {
+                verify_candidate_integrity(&case, candidate)?;
+            }
+            let eligible_candidate = candidates
+                .iter()
+                .find(|c| {
+                    c.actor.id == input.actor_id
+                        && c.actor_version == input.actor_version
+                        && c.eligible_for_metrics
+                })
+                .cloned();
+            let retry_candidates = candidates
+                .iter()
+                .filter(|c| {
+                    c.actor.id == input.actor_id
+                        && c.actor_version == input.actor_version
+                        && !c.eligible_for_metrics
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let outcome_row:Option<(String,String)>=tx.query_row("SELECT outcome_json,normalized_stage_json FROM _rowva_evaluation_human_outcomes WHERE case_id=?1",[member.case_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage)?;
+            let verified_human = outcome_row
+                .as_ref()
+                .map(|(outcome_json, human_json)| {
+                    let outcome: HumanEvaluationOutcomeInput = serde_json::from_str(outcome_json)
+                        .map_err(|_| {
+                        human_outcome_integrity("stored human outcome cannot be decoded")
+                    })?;
+                    let normalized: Value = serde_json::from_str(human_json).map_err(|_| {
+                        human_outcome_integrity("stored normalized human stage cannot be decoded")
+                    })?;
+                    verify_and_normalize_human_outcome(&tx, &case, &outcome, Some(&normalized))
+                })
+                .transpose()?;
+            let invalidation_evidence = load_invalidation_evidence(&tx, &member.case_id)?;
+            if case.status == EvaluationCaseStatus::Invalidated {
+                quality.invalidated_after_dataset_creation += 1;
+                excluded.insert(member.case_id.clone(), "invalidated".into());
+                evidence.push(EvaluationAnalysisCaseEvidenceV1 {
+                    case_id: case.id.clone(),
+                    case_bundle_digest: case.bundle_digest.clone(),
+                    lifecycle_status: case.status,
+                    invalidation_evidence,
+                    eligible_candidate,
+                    retry_candidates,
+                    human_outcome: verified_human,
+                    requested_scorer_revision: input.scorer_revision,
+                    scorer_result: None,
+                    scorer_result_verified: false,
+                    inclusion: "invalidated".into(),
+                    content_identity_digest,
+                    meeting_evidence_digest: case.evidence_digest.clone(),
+                    source_meeting_id: case.input.source_meeting_id.clone(),
+                    target_revision_identity,
+                });
+                continue;
+            }
+            content_groups
+                .entry(content_identity_digest.clone())
+                .or_default()
+                .push(case.id.clone());
+            evidence_groups
+                .entry(case.evidence_digest.clone())
+                .or_default()
+                .push(case.id.clone());
+            if let Some(meeting) = &case.input.source_meeting_id {
+                meeting_groups
+                    .entry(meeting.clone())
+                    .or_default()
+                    .push(case.id.clone());
+            }
+            target_groups
+                .entry(target_revision_identity.clone())
+                .or_default()
+                .push(case.id.clone());
+            quality.currently_valid_members += 1;
+            let Some(candidate) = eligible_candidate.as_ref() else {
+                quality.missing_candidate_cases.push(member.case_id.clone());
+                excluded.insert(member.case_id.clone(), "missing_candidate".into());
+                evidence.push(EvaluationAnalysisCaseEvidenceV1 {
+                    case_id: case.id.clone(),
+                    case_bundle_digest: case.bundle_digest.clone(),
+                    lifecycle_status: case.status,
+                    invalidation_evidence,
+                    eligible_candidate: None,
+                    retry_candidates,
+                    human_outcome: verified_human,
+                    requested_scorer_revision: input.scorer_revision,
+                    scorer_result: None,
+                    scorer_result_verified: false,
+                    inclusion: "missing_candidate".into(),
+                    content_identity_digest,
+                    meeting_evidence_digest: case.evidence_digest.clone(),
+                    source_meeting_id: case.input.source_meeting_id.clone(),
+                    target_revision_identity,
+                });
+                continue;
+            };
+            counts.distinct_cases_attempted += 1;
+            counts.eligible_decisions += 1;
+            counts.total_submitted_attempts += candidates
+                .iter()
+                .filter(|c| c.actor.id == input.actor_id && c.actor_version == input.actor_version)
+                .count() as u64;
+            quality.retry_count += retry_candidates.len() as u64;
+            counts.ineligible_retries += retry_candidates.len() as u64;
+            let Some(verified_outcome) = verified_human.as_ref() else {
+                quality.missing_human_outcomes += 1;
+                excluded.insert(member.case_id.clone(), "missing_human_outcome".into());
+                evidence.push(EvaluationAnalysisCaseEvidenceV1 {
+                    case_id: case.id.clone(),
+                    case_bundle_digest: case.bundle_digest.clone(),
+                    lifecycle_status: case.status,
+                    invalidation_evidence,
+                    eligible_candidate: eligible_candidate.clone(),
+                    retry_candidates,
+                    human_outcome: None,
+                    requested_scorer_revision: input.scorer_revision,
+                    scorer_result: None,
+                    scorer_result_verified: false,
+                    inclusion: "missing_human_outcome".into(),
+                    content_identity_digest,
+                    meeting_evidence_digest: case.evidence_digest.clone(),
+                    source_meeting_id: case.input.source_meeting_id.clone(),
+                    target_revision_identity,
+                });
+                continue;
+            };
+            let human = verified_outcome.normalized_stage.clone();
+            let recomputed = score_candidate(candidate, &human, &case.current_stage, Utc::now());
+            let stored = load_evaluation_result(&tx, &candidate.id, input.scorer_revision)?;
+            let scorer_result = if let Some(stored) = stored {
+                if stored.verdict != recomputed.verdict
+                    || stored.candidate_stage != recomputed.candidate_stage
+                    || stored.human_stage != recomputed.human_stage
+                    || stored.eligible != recomputed.eligible
+                    || stored.case_id != case.id
+                {
+                    return Err(RowvaError::validation(
+                        "evaluation_result_integrity_mismatch",
+                        "stored scorer result differs from deterministic recomputation",
+                    ));
+                }
+                stored
+            } else {
+                quality.missing_requested_scorer_results += 1;
+                tx.execute("INSERT INTO _rowva_evaluation_results(id,case_id,candidate_id,scorer_revision,candidate_stage_json,human_stage_json,verdict,eligible,scored_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![recomputed.id.as_str(),recomputed.case_id.as_str(),recomputed.candidate_id.as_str(),input.scorer_revision,recomputed.candidate_stage.as_ref().map(Value::to_string),recomputed.human_stage.to_string(),verdict_name(recomputed.verdict),recomputed.eligible,recomputed.scored_at.to_rfc3339()]).map_err(storage)?;
+                recomputed.clone()
+            };
+            included.push(member.case_id.clone());
+            counts.scored_eligible += 1;
+            let valid = candidate.validation_status == CandidateValidationStatus::Valid;
+            if valid {
+                counts.valid_scored += 1
+            } else {
+                counts.invalid_scored += 1;
+                quality.invalid_candidate_count += 1;
+            }
+            match recomputed.verdict {
+                EvaluationVerdict::ExactAgreement => {
+                    counts.exact_change_agreements += 1;
+                    counts.agreement_count += 1
+                }
+                EvaluationVerdict::NoChangeAgreement => {
+                    counts.no_change_agreements += 1;
+                    counts.agreement_count += 1
+                }
+                EvaluationVerdict::FalsePositive => counts.false_positives += 1,
+                EvaluationVerdict::FalseNegative => counts.false_negatives += 1,
+                EvaluationVerdict::WrongStage => counts.wrong_stage += 1,
+                EvaluationVerdict::Abstained => {
+                    counts.abstentions += 1;
+                    quality.abstention_count += 1
+                }
+                _ => {}
+            };
+            if human == case.current_stage {
+                quality.no_change_count += 1
+            } else {
+                quality.stage_change_count += 1;
+                *quality
+                    .destination_stage_counts
+                    .entry(human.to_string())
+                    .or_default() += 1;
+                *quality
+                    .transition_counts
+                    .entry(format!("{} -> {}", case.current_stage, human))
+                    .or_default() += 1;
+            }
+            if valid && !matches!(recomputed.verdict, EvaluationVerdict::Abstained) {
+                if let Some(confidence) = candidate.confidence {
+                    calibration_samples.push((
+                        confidence,
+                        matches!(
+                            recomputed.verdict,
+                            EvaluationVerdict::ExactAgreement
+                                | EvaluationVerdict::NoChangeAgreement
+                        ),
+                    ));
+                    quality.confidence_present_count += 1
+                } else {
+                    quality.confidence_missing_count += 1;
+                }
+            }
+            evidence.push(EvaluationAnalysisCaseEvidenceV1 {
+                case_id: case.id.clone(),
+                case_bundle_digest: case.bundle_digest.clone(),
+                lifecycle_status: case.status,
+                invalidation_evidence,
+                eligible_candidate: eligible_candidate.clone(),
+                retry_candidates,
+                human_outcome: verified_human,
+                requested_scorer_revision: input.scorer_revision,
+                scorer_result: Some(scorer_result),
+                scorer_result_verified: true,
+                inclusion: "included".into(),
+                content_identity_digest,
+                meeting_evidence_digest: case.evidence_digest.clone(),
+                source_meeting_id: case.input.source_meeting_id.clone(),
+                target_revision_identity,
+            });
+        }
+        quality.included_members = included.len() as u64;
+        quality.excluded_members = excluded.len() as u64;
+        quality.duplicate_content_groups = content_groups
+            .into_values()
+            .filter(|v| v.len() > 1)
+            .collect();
+        quality.repeated_evidence_groups = evidence_groups
+            .into_values()
+            .filter(|v| v.len() > 1)
+            .collect();
+        quality.repeated_source_meeting_groups = meeting_groups
+            .into_values()
+            .filter(|v| v.len() > 1)
+            .collect();
+        quality.repeated_target_revision_groups = target_groups
+            .into_values()
+            .filter(|v| v.len() > 1)
+            .collect();
+        for groups in [
+            &mut quality.duplicate_content_groups,
+            &mut quality.repeated_evidence_groups,
+            &mut quality.repeated_source_meeting_groups,
+            &mut quality.repeated_target_revision_groups,
+        ] {
+            for group in groups.iter_mut() {
+                group.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            }
+            groups.sort_by(|a, b| a[0].as_str().cmp(b[0].as_str()));
+        }
+        let reference = quality.no_change_count + quality.stage_change_count;
+        quality.no_change_rate =
+            (reference > 0).then_some(quality.no_change_count as f64 / reference as f64);
+        quality.stage_change_rate =
+            (reference > 0).then_some(quality.stage_change_count as f64 / reference as f64);
+        quality.eligible_candidate_coverage = (quality.currently_valid_members > 0)
+            .then_some(included.len() as f64 / quality.currently_valid_members as f64);
+        if included.len() < 20 {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "insufficient_case_count".into(),
+                case_ids: vec![],
+                message: "fewer than 20 included cases".into(),
+            });
+        }
+        if quality.confidence_present_count < 20 {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "insufficient_calibration_evidence".into(),
+                case_ids: vec![],
+                message: "fewer than 20 calibrated samples".into(),
+            });
+        }
+        if !quality.duplicate_content_groups.is_empty() {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "duplicate_case_content".into(),
+                case_ids: quality
+                    .duplicate_content_groups
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect(),
+                message:
+                    "duplicate frozen content detected; hashes do not prove semantic equivalence"
+                        .into(),
+            });
+        }
+        if !quality.repeated_evidence_groups.is_empty() {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "repeated_meeting_evidence".into(),
+                case_ids: quality
+                    .repeated_evidence_groups
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect(),
+                message: "meeting evidence digest is repeated".into(),
+            });
+        }
+        if !quality.repeated_source_meeting_groups.is_empty() {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "repeated_source_meeting_id".into(),
+                case_ids: quality
+                    .repeated_source_meeting_groups
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect(),
+                message: "source meeting identifier is repeated".into(),
+            });
+        }
+        if reference >= 10
+            && (quality.no_change_count.min(quality.stage_change_count) as f64 / reference as f64)
+                < 0.1
+        {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "reference_label_imbalance".into(),
+                case_ids: vec![],
+                message: "one human reference class is below 10%".into(),
+            });
+        }
+        if quality.eligible_candidate_coverage.is_some_and(|v| v < 0.8) {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "low_candidate_coverage".into(),
+                case_ids: quality.missing_candidate_cases.clone(),
+                message: "eligible candidate coverage is below 80%".into(),
+            });
+        }
+        if quality.included_members > 0
+            && quality.abstention_count as f64 / quality.included_members as f64 > 0.2
+        {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "high_abstention_rate".into(),
+                case_ids: vec![],
+                message: "abstention rate exceeds 20%".into(),
+            });
+        }
+        if quality.included_members > 0
+            && quality.invalid_candidate_count as f64 / quality.included_members as f64 > 0.1
+        {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "high_invalid_candidate_rate".into(),
+                case_ids: vec![],
+                message: "invalid candidate rate exceeds 10%".into(),
+            });
+        }
+        if quality.confidence_missing_count > 0 {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "missing_confidence".into(),
+                case_ids: vec![],
+                message: "one or more calibration-eligible candidates omit confidence".into(),
+            });
+        }
+        if quality.invalidated_after_dataset_creation > 0 {
+            quality.warnings.push(EvaluationQualityWarning {
+                code: "cases_invalidated_after_snapshot".into(),
+                case_ids: excluded
+                    .iter()
+                    .filter_map(|(id, reason)| (reason == "invalidated").then_some(id.clone()))
+                    .collect(),
+                message: "dataset members were invalidated after snapshot".into(),
+            });
+        }
+        let accuracy = counts.scored_eligible.saturating_sub(counts.abstentions);
+        let (class, reasons) = readiness(&counts);
+        let metrics = EvaluationMetrics {
+            workflow: EvaluationWorkflow::DealStageQualificationV1,
+            actor_id: input.actor_id.clone(),
+            actor_version: input.actor_version.clone(),
+            agreement_rate: (accuracy > 0)
+                .then_some(counts.agreement_count as f64 / accuracy as f64),
+            exact_change_agreement_rate: (accuracy > 0)
+                .then_some(counts.exact_change_agreements as f64 / accuracy as f64),
+            coverage_rate: (counts.scored_eligible > 0)
+                .then_some(accuracy as f64 / counts.scored_eligible as f64),
+            invalid_proposal_rate: (counts.scored_eligible > 0)
+                .then_some(counts.invalid_scored as f64 / counts.scored_eligible as f64),
+            counts,
+            readiness_rubric_revision: input.readiness_rubric_revision,
+            readiness: class,
+            readiness_reasons: reasons,
+            advisory_only: true,
+        };
+        let mut calibration = confidence_calibration(&calibration_samples);
+        calibration.missing_confidence = quality.confidence_missing_count;
+        calibration.abstentions_excluded = quality.abstention_count;
+        calibration.invalid_excluded = quality.invalid_candidate_count;
+        calibration.retries_excluded = quality.retry_count;
+        calibration.invalidated_cases_excluded = quality.invalidated_after_dataset_creation;
+        calibration.missing_outcomes_excluded = quality.missing_human_outcomes;
+        calibration.unscored_candidates_excluded = quality.missing_requested_scorer_results;
+        calibration.integrity_failures_excluded = quality.integrity_failures;
+        let analysis_evidence = EvaluationAnalysisEvidenceV1 {
+            protocol_version: 1,
+            dataset_id: dataset.manifest.dataset_id.clone(),
+            dataset_digest: dataset.dataset_digest.clone(),
+            workflow: dataset.manifest.workflow,
+            workflow_version: dataset.manifest.workflow_version,
+            target_actor_id: input.actor_id.clone(),
+            target_actor_version: input.actor_version.clone(),
+            cases: evidence,
+        };
+        let input_digest = sha256_digest(
+            &json!({"request":input,"dataset_digest":dataset.dataset_digest,"analysis_evidence":analysis_evidence,"scorer_revision":input.scorer_revision,"readiness_rubric_revision":input.readiness_rubric_revision,"quality_revision":input.quality_revision,"calibration_revision":input.calibration_revision}),
+        )?;
+        if let Some(id) = tx
+            .query_row(
+                "SELECT id FROM _rowva_evaluation_analysis_runs WHERE analysis_input_digest=?1",
+                [&input_digest],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+        {
+            return load_analysis(&tx, &EvaluationAnalysisRunId::from_string(id)?);
+        }
+        let report = EvaluationAnalysisReportV1 {
+            protocol_version: 1,
+            dataset_id: dataset.manifest.dataset_id.clone(),
+            dataset_digest: dataset.dataset_digest.clone(),
+            actor_id: input.actor_id,
+            actor_version: input.actor_version,
+            scorer_revision: input.scorer_revision,
+            readiness_rubric_revision: input.readiness_rubric_revision,
+            quality_revision: input.quality_revision,
+            calibration_revision: input.calibration_revision,
+            included_case_ids: included,
+            excluded_cases: excluded,
+            metrics,
+            quality,
+            calibration,
+            advisory_only: true,
+        };
+        let report_json = serde_json::to_string(&report).map_err(internal)?;
+        let report_value: Value = serde_json::from_str(&report_json).map_err(internal)?;
+        let report_digest = sha256_digest(&report_value)?;
+        let run = EvaluationAnalysisRun {
+            id: EvaluationAnalysisRunId::new(),
+            analysis_input_digest: input_digest,
+            report_digest,
+            created_at: Utc::now(),
+            evidence: analysis_evidence,
+            report,
+        };
+        tx.execute("INSERT INTO _rowva_evaluation_analysis_runs(id,dataset_id,dataset_digest,actor_id,actor_version,scorer_revision,readiness_rubric_revision,quality_revision,calibration_revision,analysis_input_digest,evidence_json,report_json,report_digest,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![run.id.as_str(),run.report.dataset_id.as_str(),run.report.dataset_digest,run.report.actor_id.as_str(),run.report.actor_version,run.report.scorer_revision,run.report.readiness_rubric_revision,run.report.quality_revision,run.report.calibration_revision,run.analysis_input_digest,serde_json::to_string(&run.evidence).map_err(internal)?,report_json,run.report_digest,run.created_at.to_rfc3339()]).map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(run)
+    }
+    fn get_evaluation_analysis(
+        &self,
+        id: &EvaluationAnalysisRunId,
+    ) -> Result<EvaluationAnalysisRun, RowvaError> {
+        load_analysis(&self.conn, id)
+    }
+    fn list_evaluation_analyses(&self) -> Result<Vec<EvaluationAnalysisRun>, RowvaError> {
+        let mut s = self
+            .conn
+            .prepare("SELECT id FROM _rowva_evaluation_analysis_runs ORDER BY created_at,id")
+            .map_err(storage)?;
+        let ids = s
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        ids.into_iter()
+            .map(|v| load_analysis(&self.conn, &EvaluationAnalysisRunId::from_string(v)?))
+            .collect()
+    }
+    fn export_evaluation_dataset(
+        &self,
+        id: &EvaluationDatasetId,
+        profile: EvaluationExportProfile,
+    ) -> Result<EvaluationDatasetExport, RowvaError> {
+        let dataset = self.get_evaluation_dataset(id)?;
+        let analyses: Vec<EvaluationAnalysisRun> = self
+            .list_evaluation_analyses()?
+            .into_iter()
+            .filter(|r| r.report.dataset_id == *id)
+            .collect();
+        let cases=match profile{EvaluationExportProfile::Metadata=>Value::Array(dataset.manifest.case_members.iter().map(|m|json!({"case_id":m.case_id,"bundle_digest":m.case_bundle_digest,"status_at_snapshot":m.status_at_snapshot,"created_at":m.case_created_at,"scorer_revisions":m.scorer_revisions})).collect()),EvaluationExportProfile::FullLocal=>Value::Array(dataset.manifest.case_members.iter().map(|m|full_local_case_evidence(&self.conn,&m.case_id)).collect::<Result<Vec<_>,_>>()?)};
+        let dataset_value = if profile == EvaluationExportProfile::Metadata {
+            json!({"dataset_id":dataset.manifest.dataset_id,"dataset_digest":dataset.dataset_digest,"workflow":dataset.manifest.workflow,"workflow_version":dataset.manifest.workflow_version,"created_at":dataset.manifest.created_at,"creator_actor_id":dataset.manifest.creator.id,"case_count":dataset.manifest.case_members.len()})
+        } else {
+            serde_json::to_value(&dataset).map_err(internal)?
+        };
+        let analysis_values = if profile == EvaluationExportProfile::Metadata {
+            Value::Array(analyses.iter().map(|run|{let mut quality=run.report.quality.clone();quality.destination_stage_counts.clear();quality.transition_counts.clear();json!({"analysis_id":run.id,"analysis_input_digest":run.analysis_input_digest,"report_digest":run.report_digest,"created_at":run.created_at,"actor_id":run.report.actor_id,"actor_version":run.report.actor_version,"scorer_revision":run.report.scorer_revision,"readiness_rubric_revision":run.report.readiness_rubric_revision,"included_case_ids":run.report.included_case_ids,"excluded_cases":run.report.excluded_cases,"metrics":run.report.metrics,"quality":quality,"calibration":run.report.calibration,"advisory_only":true})}).collect())
+        } else {
+            serde_json::to_value(&analyses).map_err(internal)?
+        };
+        let payload = EvaluationDatasetExportPayload {
+            protocol_version: 1,
+            profile,
+            sensitivity: if profile == EvaluationExportProfile::Metadata {
+                "metadata_only"
+            } else {
+                "full_local_sensitive"
+            }
+            .into(),
+            contains_sensitive_values: profile == EvaluationExportProfile::FullLocal,
+            dataset: dataset_value,
+            analysis_runs: analysis_values,
+            cases,
+        };
+        Ok(EvaluationDatasetExport {
+            export_digest: sha256_digest(&payload)?,
+            payload,
+        })
+    }
+}
+
+fn enum_json_name<T: serde::Serialize>(value: &T) -> Result<String, RowvaError> {
+    serde_json::to_string(value)
+        .map(|v| v.trim_matches('"').to_owned())
+        .map_err(internal)
+}
+fn verify_dataset_membership(
+    conn: &Connection,
+    dataset: &EvaluationDataset,
+) -> Result<(), RowvaError> {
+    let mut stmt=conn.prepare("SELECT case_id,position,case_bundle_digest,status_at_snapshot,case_created_at,human_outcome_present,scorer_revisions_json FROM _rowva_evaluation_dataset_cases WHERE dataset_id=?1 ORDER BY position").map_err(storage)?;
+    let rows = stmt
+        .query_map([dataset.manifest.dataset_id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, bool>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    if rows.len() != dataset.manifest.case_members.len() {
+        return Err(RowvaError::validation(
+            "evaluation_dataset_integrity_mismatch",
+            "dataset membership count differs from canonical manifest",
+        ));
+    }
+    for (row, member) in rows.iter().zip(&dataset.manifest.case_members) {
+        let revisions: Vec<u16> = serde_json::from_str(&row.6).map_err(internal)?;
+        if row.0 != member.case_id.as_str()
+            || row.1 != member.position
+            || row.2 != member.case_bundle_digest
+            || row.3 != enum_json_name(&member.status_at_snapshot)?
+            || row.4 != member.case_created_at.to_rfc3339()
+            || row.5 != member.human_outcome_present
+            || revisions != member.scorer_revisions
+        {
+            return Err(RowvaError::validation(
+                "evaluation_dataset_integrity_mismatch",
+                "relational dataset membership differs from canonical manifest",
+            ));
+        }
+    }
+    Ok(())
+}
+fn load_dataset(
+    conn: &Connection,
+    id: &EvaluationDatasetId,
+) -> Result<EvaluationDataset, RowvaError> {
+    let row:Option<(String,String,String)>=conn.query_row("SELECT manifest_json,dataset_digest,status FROM _rowva_evaluation_datasets WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(storage)?;
+    let (json, digest, status) =
+        row.ok_or_else(|| RowvaError::not_found("evaluation_dataset", id.as_str()))?;
+    if status != "sealed" {
+        return Err(RowvaError::validation(
+            "evaluation_dataset_integrity_mismatch",
+            "dataset is not sealed",
+        ));
+    }
+    let manifest: EvaluationDatasetManifestV1 = serde_json::from_str(&json).map_err(internal)?;
+    if manifest.dataset_id != *id || evaluation_dataset_digest(&manifest)? != digest {
+        return Err(RowvaError::validation(
+            "evaluation_dataset_integrity_mismatch",
+            "dataset manifest failed integrity verification",
+        ));
+    }
+    let dataset = EvaluationDataset {
+        manifest,
+        dataset_digest: digest,
+    };
+    verify_dataset_membership(conn, &dataset)?;
+    Ok(dataset)
+}
+fn load_invalidation_evidence(
+    conn: &Connection,
+    case_id: &EvaluationCaseId,
+) -> Result<Option<Value>, RowvaError> {
+    type InvalidationEvidenceRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u16,
+    );
+    let row:Option<InvalidationEvidenceRow>=conn.query_row("SELECT id,category,reason,actor_json,previous_status,invalidated_at,related_case_id,protocol_version FROM _rowva_evaluation_invalidations WHERE case_id=?1",[case_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(storage)?;
+    row.map(|r|{let actor:ActorContext=serde_json::from_str(&r.3).map_err(internal)?;Ok(json!({"invalidation_id":r.0,"category":r.1,"reason":r.2,"actor":actor,"previous_status":r.4,"invalidated_at":r.5,"related_case_id":r.6,"protocol_version":r.7}))}).transpose()
+}
+fn full_local_case_evidence(
+    conn: &Connection,
+    case_id: &EvaluationCaseId,
+) -> Result<Value, RowvaError> {
+    let case = load_evaluation_case(conn, case_id)?;
+    verify_case_integrity(&case)?;
+    let candidates = load_candidates(conn, case_id)?;
+    for candidate in &candidates {
+        verify_candidate_integrity(&case, candidate)?;
+    }
+    let outcome_row:Option<(String,String)>=conn.query_row("SELECT outcome_json,normalized_stage_json FROM _rowva_evaluation_human_outcomes WHERE case_id=?1",[case_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage)?;
+    let outcome = outcome_row
+        .map(|(input, normalized)| {
+            let input: HumanEvaluationOutcomeInput =
+                serde_json::from_str(&input).map_err(internal)?;
+            let normalized: Value = serde_json::from_str(&normalized).map_err(internal)?;
+            verify_and_normalize_human_outcome(conn, &case, &input, Some(&normalized))
+        })
+        .transpose()?;
+    Ok(
+        json!({"case":case,"candidates":candidates,"human_outcome":outcome,"invalidation":load_invalidation_evidence(conn,case_id)?}),
+    )
+}
+fn load_evaluation_result(
+    conn: &Connection,
+    candidate_id: &EvaluationCandidateId,
+    revision: u16,
+) -> Result<Option<EvaluationResult>, RowvaError> {
+    type R = (String, String, Option<String>, String, String, bool, String);
+    let row:Option<R>=conn.query_row("SELECT id,case_id,candidate_stage_json,human_stage_json,verdict,eligible,scored_at FROM _rowva_evaluation_results WHERE candidate_id=?1 AND scorer_revision=?2",params![candidate_id.as_str(),revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().map_err(storage)?;
+    row.map(|r| {
+        Ok(EvaluationResult {
+            id: EvaluationResultId::from_string(r.0)?,
+            case_id: EvaluationCaseId::from_string(r.1)?,
+            candidate_id: candidate_id.clone(),
+            scorer_revision: revision,
+            candidate_stage: r
+                .2
+                .map(|v| serde_json::from_str(&v).map_err(internal))
+                .transpose()?,
+            human_stage: serde_json::from_str(&r.3).map_err(internal)?,
+            verdict: parse_verdict(&r.4)?,
+            eligible: r.5,
+            scored_at: parse_time(r.6),
+        })
+    })
+    .transpose()
+}
+fn load_analysis(
+    conn: &Connection,
+    id: &EvaluationAnalysisRunId,
+) -> Result<EvaluationAnalysisRun, RowvaError> {
+    let row:Option<(String,String,String,String,String)>=conn.query_row("SELECT analysis_input_digest,evidence_json,report_json,report_digest,created_at FROM _rowva_evaluation_analysis_runs WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(storage)?;
+    let (input, evidence_json, report_json, digest, created) =
+        row.ok_or_else(|| RowvaError::not_found("evaluation_analysis", id.as_str()))?;
+    let evidence: EvaluationAnalysisEvidenceV1 =
+        serde_json::from_str(&evidence_json).map_err(internal)?;
+    let report_value: Value = serde_json::from_str(&report_json).map_err(internal)?;
+    if sha256_digest(&report_value)? != digest {
+        return Err(RowvaError::validation(
+            "evaluation_analysis_integrity_mismatch",
+            "analysis report failed integrity verification",
+        ));
+    }
+    let report: EvaluationAnalysisReportV1 =
+        serde_json::from_value(report_value).map_err(internal)?;
+    let request = EvaluationAnalysisRequestV1 {
+        protocol_version: report.protocol_version,
+        dataset_id: report.dataset_id.clone(),
+        actor_id: report.actor_id.clone(),
+        actor_version: report.actor_version.clone(),
+        scorer_revision: report.scorer_revision,
+        readiness_rubric_revision: report.readiness_rubric_revision,
+        quality_revision: report.quality_revision,
+        calibration_revision: report.calibration_revision,
+    };
+    let recomputed = sha256_digest(
+        &json!({"request":request,"dataset_digest":report.dataset_digest,"analysis_evidence":evidence,"scorer_revision":report.scorer_revision,"readiness_rubric_revision":report.readiness_rubric_revision,"quality_revision":report.quality_revision,"calibration_revision":report.calibration_revision}),
+    )?;
+    if recomputed != input {
+        return Err(RowvaError::validation(
+            "evaluation_analysis_integrity_mismatch",
+            "analysis input digest does not match canonical evidence",
+        ));
+    }
+    Ok(EvaluationAnalysisRun {
+        id: id.clone(),
+        analysis_input_digest: input,
+        report_digest: digest,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created)
+            .map_err(internal)?
+            .with_timezone(&Utc),
+        evidence,
+        report,
+    })
+}
+
+fn human_outcome_integrity(message: &str) -> RowvaError {
+    RowvaError::validation("evaluation_human_outcome_integrity_mismatch", message)
+}
+fn verify_and_normalize_human_outcome(
+    conn: &Connection,
+    case: &EvaluationCase,
+    outcome: &HumanEvaluationOutcomeInput,
+    stored_normalized: Option<&Value>,
+) -> Result<VerifiedHumanOutcomeEvidenceV1, RowvaError> {
+    let (normalized_stage, operation_evidence) = match outcome {
+        HumanEvaluationOutcomeInput::NoChange { actor, reason } => {
+            let actor = validate_evaluation_actor(actor, false)
+                .map_err(|_| human_outcome_integrity("human actor evidence is invalid"))?;
+            if actor.actor_type != ActorType::Human {
+                return Err(human_outcome_integrity(
+                    "no-change reference requires a human actor",
+                ));
+            }
+            if reason.as_ref().is_some_and(|v| v.len() > MAX_REASON_BYTES) {
+                return Err(human_outcome_integrity(
+                    "human no-change reason exceeds the limit",
+                ));
+            }
+            (case.current_stage.clone(), None)
+        }
+        HumanEvaluationOutcomeInput::CommittedOperation { operation_id } => {
+            let operation = load_operation_evidence(conn, operation_id).map_err(|_| {
+                human_outcome_integrity("linked operation does not exist or cannot be loaded")
+            })?;
+            if operation.status != OperationStatus::Committed
+                || operation.actor.actor_type != ActorType::Human
+                || operation.mode != OperationMode::Commit
+            {
+                return Err(human_outcome_integrity(
+                    "linked operation is not a committed human mutation",
+                ));
+            }
+            if operation.base_schema_revision != case.base_schema_revision {
+                return Err(human_outcome_integrity(
+                    "linked operation schema revision differs from the frozen case",
+                ));
+            }
+            let request: OperationRequest = serde_json::from_value(operation.request.clone())
+                .map_err(|_| {
+                    human_outcome_integrity("linked operation request cannot be decoded")
+                })?;
+            if request.actor.id != operation.actor.id
+                || request.actor.actor_type != ActorType::Human
+                || request.mode != OperationMode::Commit
+            {
+                return Err(human_outcome_integrity(
+                    "linked operation actor or mode evidence is inconsistent",
+                ));
+            }
+            let value = match &request.command {
+                Command::UpdateRecord {
+                    object_id,
+                    record_id,
+                    values,
+                    expected_revision: Some(revision),
+                } if object_id == &case.target_object_id
+                    && record_id == &case.target_record_id
+                    && revision == &case.base_record_revision
+                    && values.len() == 1 =>
+                {
+                    values
+                        .get(&case.target_stage_field.id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            human_outcome_integrity(
+                                "linked operation does not update the evaluated stage",
+                            )
+                        })?
+                }
+                _ => {
+                    return Err(human_outcome_integrity(
+                        "linked operation must be a revision-bound stage-only update",
+                    ))
+                }
+            };
+            if !field_value_is_valid(&case.target_stage_field, &value) {
+                return Err(human_outcome_integrity(
+                    "linked operation stage value is invalid for the frozen field",
+                ));
+            }
+            if operation.changes.len() != 1 {
+                return Err(human_outcome_integrity(
+                    "linked operation contains unrelated changes",
+                ));
+            }
+            let change = &operation.changes[0];
+            if change.object_id != case.target_object_id
+                || change.record_id.as_ref() != Some(&case.target_record_id)
+                || change.field_id.as_ref() != Some(&case.target_stage_field.id)
+                || change.before.as_ref() != Some(&case.current_stage)
+                || change.after.as_ref() != Some(&value)
+            {
+                return Err(human_outcome_integrity(
+                    "linked operation request and change evidence disagree",
+                ));
+            }
+            let result = operation
+                .result
+                .as_ref()
+                .and_then(Value::as_object)
+                .ok_or_else(|| human_outcome_integrity("linked operation result is missing"))?;
+            if result.get("record_id").and_then(Value::as_str)
+                != Some(case.target_record_id.as_str())
+                || result.get("revision").and_then(Value::as_i64)
+                    != Some(case.base_record_revision.0 + 1)
+                || result
+                    .get("values")
+                    .and_then(Value::as_object)
+                    .and_then(|v| v.get(case.target_stage_field.id.as_str()))
+                    != Some(&value)
+            {
+                return Err(human_outcome_integrity(
+                    "linked operation result disagrees with its request and changes",
+                ));
+            }
+            (
+                value,
+                Some(serde_json::to_value(&operation).map_err(internal)?),
+            )
+        }
+    };
+    if stored_normalized.is_some_and(|stored| stored != &normalized_stage) {
+        return Err(human_outcome_integrity(
+            "stored normalized human stage disagrees with verified outcome evidence",
+        ));
+    }
+    Ok(VerifiedHumanOutcomeEvidenceV1 {
+        protocol_version: 1,
+        case_id: case.id.clone(),
+        outcome: outcome.clone(),
+        normalized_stage,
+        operation_evidence,
+    })
 }
 
 fn verify_case_integrity(case: &EvaluationCase) -> Result<(), RowvaError> {
@@ -1912,6 +2941,25 @@ fn verdict_name(v: EvaluationVerdict) -> &'static str {
         EvaluationVerdict::InvalidValue => "invalid_value",
         EvaluationVerdict::UnsafeExtraChanges => "unsafe_extra_changes",
         EvaluationVerdict::InvalidCandidate => "invalid_candidate",
+    }
+}
+fn parse_verdict(value: &str) -> Result<EvaluationVerdict, RowvaError> {
+    match value {
+        "exact_agreement" => Ok(EvaluationVerdict::ExactAgreement),
+        "no_change_agreement" => Ok(EvaluationVerdict::NoChangeAgreement),
+        "false_positive" => Ok(EvaluationVerdict::FalsePositive),
+        "false_negative" => Ok(EvaluationVerdict::FalseNegative),
+        "wrong_stage" => Ok(EvaluationVerdict::WrongStage),
+        "abstained" => Ok(EvaluationVerdict::Abstained),
+        "invalid_target" => Ok(EvaluationVerdict::InvalidTarget),
+        "stale_revision" => Ok(EvaluationVerdict::StaleRevision),
+        "invalid_value" => Ok(EvaluationVerdict::InvalidValue),
+        "unsafe_extra_changes" => Ok(EvaluationVerdict::UnsafeExtraChanges),
+        "invalid_candidate" => Ok(EvaluationVerdict::InvalidCandidate),
+        _ => Err(RowvaError::validation(
+            "evaluation_result_integrity_mismatch",
+            "stored scorer verdict is unknown",
+        )),
     }
 }
 

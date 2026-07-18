@@ -4,6 +4,8 @@ RowvAI is the public product name. Existing `rowva` internal namespaces and prot
 
 Shadow mode is parallel recommendation, not preview, approval, or execution. RowvAI seals a minimal deal-stage case before a human outcome is exposed. External agents receive the same frozen bundle and submit attributable recommendations. Candidates never enter `_rowva_operations` or the approval inbox and have no commit identity.
 
+Dataset curation, terminal invalidation, immutable analysis runs, duplicate diagnostics, and confidence calibration are documented in [evaluation dataset quality](evaluation-data-quality.md). Live reports exclude invalidated cases by default; historical evidence remains inspectable.
+
 ## First workflow
 
 `deal_stage_qualification_v1` freezes immutable object, record, and stage-field IDs; schema and record revisions; the complete configured stage field; selected record values; structured synthetic meeting evidence; and a permitted-output schema. Missing optional selected values are represented as JSON `null`. Only an exact, single-value `StageUpdateProposalV1` against the frozen target and revision is valid; the general operation `Command` protocol is not accepted. No-change and abstain are explicit decisions.
@@ -12,7 +14,7 @@ The exported object is `{ "bundle": EvaluationCaseBundleV1, "bundle_digest": "..
 
 Evidence, actor labels, versions, client/session IDs, and reasons are untrusted and byte-bounded at import. Imported capabilities are discarded before actor persistence and never convey authority. Selected field IDs are bounded, unique, and verified against the target object.
 
-A human reference label is either linked to an existing committed human stage-only `UpdateRecord` operation or recorded explicitly as no-change. A linked operation must have an expected record revision, matching base schema revision, matching frozen before-stage, and a valid after-stage. The mutation is not replayed or duplicated. Recording an outcome closes blind collection. RowvAI can prove which bundle a candidate bound and what the evaluation interface exposed; it cannot prove an external agent did not inspect live state elsewhere.
+A human reference label is either linked to an existing committed human stage-only `UpdateRecord` operation or recorded explicitly as no-change. Outcome recording and later analysis use the same verifier. A linked operation must have an expected record revision, matching base schema revision, matching frozen before-stage, valid after-stage, and mutually consistent command, result, and change rows. The mutation is not replayed or duplicated. Recording an outcome closes blind collection. RowvAI can prove which bundle a candidate bound and what the evaluation interface exposed; it cannot prove an external agent did not inspect live state elsewhere.
 
 Historical target IDs are snapshots, not foreign keys to mutable CRM rows. Deleting a live record therefore neither blocks normal CRM behavior nor cascades evaluation evidence; replay continues from the frozen snapshot.
 
@@ -41,5 +43,7 @@ cargo run -p rowva-eval -- report --workspace /absolute/demo.rowva --json
 ```
 
 `fixture run` creates a temporary workspace per scenario, constructs schema and data, verifies export integrity, submits candidates, records the human reference, scores, replays, compares expected verdicts, and checks that shadow actions did not mutate authoritative state. Any mismatch exits nonzero. Committed fixtures are synthetic and network-free.
+
+`fixture quality-run fixtures/quality/deal_stage_quality_cases.json --json` executes the complementary sixteen-scenario dataset-quality suite, including canonical analysis idempotency, lifecycle invalidation, calibration, duplicate/repeated evidence diagnostics, structural metadata privacy, explicit sensitive export, and authority-mutation checks.
 
 Put private local dogfood inputs beneath `.local/eval/`, which Git ignores. Operators remain responsible for file permissions because meeting evidence, snapshots, reasons, and model output may contain sensitive data. Evaluation evidence is retained append-only and can contain values; field-level redaction, configurable retention, a desktop dashboard, model invocation, additional workflows, and proof of external blindness are deferred.

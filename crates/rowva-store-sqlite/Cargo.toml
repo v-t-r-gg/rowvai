@@ -9,6 +9,7 @@ chrono.workspace = true
 rowva-core = { path = "../rowva-core" }
 rusqlite.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 
