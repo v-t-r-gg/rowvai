@@ -7,6 +7,9 @@ use std::{collections::HashMap, fmt, hash::Hash};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod evaluation;
+pub use evaluation::*;
+
 macro_rules! id_type {
     ($name:ident, $prefix:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +73,7 @@ pub enum ActorType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActorContext {
     pub id: ActorId,
     pub actor_type: ActorType,

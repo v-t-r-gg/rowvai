@@ -10,7 +10,7 @@ The prototype centered a relational spreadsheet UI. Agents need stable semantics
 
 ## Decision
 
-Rowva is a local-first, model-neutral CRM state and action runtime. A generic object/field/record engine supports optional CRM semantics. Humans and machines are explicit actors. The grid is one thin view.
+RowvAI is a local-first, model-neutral CRM state and action runtime. A generic object/field/record engine supports optional CRM semantics. Humans and machines are explicit actors. The grid is one thin view.
 
 ## Consequences
 

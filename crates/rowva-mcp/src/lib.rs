@@ -200,9 +200,9 @@ impl RowvaMcp {
 impl RowvaMcp {
     #[tool(
         name = "rowva_workspace_describe",
-        description = "Describe the single Rowva workspace bound to this process without exposing its filesystem path.",
+        description = "Describe the single RowvAI workspace bound to this process without exposing its filesystem path.",
         annotations(
-            title = "Describe Rowva workspace",
+            title = "Describe RowvAI workspace",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -225,7 +225,7 @@ impl RowvaMcp {
         name = "rowva_schema_describe",
         description = "Describe all logical CRM objects and complete safe field definitions, or one object by immutable ID.",
         annotations(
-            title = "Describe Rowva schema",
+            title = "Describe RowvAI schema",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -256,7 +256,7 @@ impl RowvaMcp {
         name = "rowva_records_search",
         description = "Search records with bounded typed filters. SQL fragments and filesystem paths are not accepted.",
         annotations(
-            title = "Search Rowva records",
+            title = "Search RowvAI records",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -297,7 +297,7 @@ impl RowvaMcp {
         name = "rowva_record_get",
         description = "Retrieve one record by immutable object and record IDs with field-ID-keyed values.",
         annotations(
-            title = "Get Rowva record",
+            title = "Get RowvAI record",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -321,7 +321,7 @@ impl RowvaMcp {
         name = "rowva_operation_preview",
         description = "Persist a state-bound proposal for create_record or update_record without changing business state.",
         annotations(
-            title = "Preview Rowva operation",
+            title = "Preview RowvAI operation",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
@@ -350,7 +350,7 @@ impl RowvaMcp {
         name = "rowva_operation_commit",
         description = "Commit the exact stored preview identified by operation ID and state-bound fingerprint. No replacement command is accepted.",
         annotations(
-            title = "Commit Rowva operation",
+            title = "Commit RowvAI operation",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
@@ -375,7 +375,7 @@ impl RowvaMcp {
         name = "rowva_operation_get",
         description = "Inspect one durable operation owned by the configured actor.",
         annotations(
-            title = "Get Rowva operation",
+            title = "Get RowvAI operation",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -407,7 +407,7 @@ impl RowvaMcp {
         name = "rowva_operation_list",
         description = "List concise operation history owned by the configured actor with bounded filtering.",
         annotations(
-            title = "List Rowva operations",
+            title = "List RowvAI operations",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -573,7 +573,7 @@ fn error_envelope(error: RowvaError, operation: Option<OperationId>) -> Value {
             true,
             Some(json!({"action":"retry_later"})),
         ),
-        RowvaError::Internal { .. } => ("internal", "internal Rowva error".into(), false, None),
+        RowvaError::Internal { .. } => ("internal", "internal RowvAI error".into(), false, None),
     };
     json!({"error":{"code":error_code(&error),"category":category,"message":message,"retryable":retryable,"recovery":recovery,"operation_id":operation}})
 }

@@ -2,8 +2,8 @@
 name = "rowva"
 version = "0.1.0"
 edition = "2021"
-description = "Rowva — Local-first relational spreadsheet CRM"
-license = "MIT OR Apache-2.0"
+description = "RowvAI — Local-first relational spreadsheet CRM"
+license = "Apache-2.0"
 
 [lib]
 name = "rowva_lib"

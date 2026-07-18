@@ -13,7 +13,7 @@ use uuid::Uuid;
 #[command(
     name = "rowva-mcp",
     version,
-    about = "Accountable Rowva MCP stdio adapter"
+    about = "Accountable RowvAI MCP stdio adapter"
 )]
 struct Cli {
     #[command(subcommand)]

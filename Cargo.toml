@@ -1,11 +1,11 @@
 [workspace]
-members = ["crates/rowva-core", "crates/rowva-store-sqlite", "crates/rowva-mcp", "src-tauri"]
+members = ["crates/rowva-core", "crates/rowva-store-sqlite", "crates/rowva-mcp", "crates/rowva-eval", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -18,3 +18,4 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+clap = { version = "4.5", features = ["derive"] }
