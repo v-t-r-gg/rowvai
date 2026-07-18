@@ -33,6 +33,12 @@ Node-runtime warning.
   comparisons are stable for scenarios containing multiple agent versions.
 - Updated GitHub Actions to `actions/checkout@v5` and
   `actions/setup-node@v5`, and added direct executable-fixture execution.
+- Detected that local pre-task commit `01ef77d` contained the excluded
+  `.gitignore` and `AGENTS.md` changes. Preserved it as a temporary patch,
+  replayed only the hardening commit onto the remote PR head, and restored those
+  files as unstaged local changes. They were not added to PR #2.
+- Pushed hardening commit `86a1d4b5a6a703728810dd0dbbe8c5d8e12e5929`
+  to `origin/feat/shadow-evaluation-foundation`.
 
 ## Decisions and rationale
 
@@ -89,6 +95,10 @@ Node-runtime warning.
   advisories: 5 total vulnerabilities (2 low, 1 moderate, 2 high), including
   high-severity findings in `picomatch` and `vite`. No broad dependency update
   was applied.
+- GitHub Actions run `29637483655` passed in 1m44s. It ran formatting,
+  workspace tests, Clippy, MCP smoke, CLI tests, the direct ten-scenario fixture,
+  `npm ci`, and the frontend build. GitHub returned no check annotations, so the
+  deprecated Node.js 20 action-runtime warning was absent.
 
 ## Risks and unresolved questions
 
@@ -99,4 +109,7 @@ Node-runtime warning.
 
 ## Outcome
 
-In progress.
+Complete. Candidate collection and outcome scoring are serialized across SQLite
+connections, candidate evidence is verified before scoring and replay, fixture
+mutation evidence is explicit, and PR #2 CI uses current GitHub action runtimes.
+The branch is ready for review; no merge was performed.
