@@ -1,13 +1,19 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { commands } from './lib/tauri';
 import Grid from './components/Grid';
+import type { GridData, ObjectSummary, RowvaError } from './types/rowva';
+import type { OperationRecord } from './types/rowva';
+import AgentActivity from './components/AgentActivity';
 
 function App() {
   const [workbookPath, setWorkbookPath] = useState<string | null>(null);
-  const [tables, setTables] = useState<any[]>([]); // sidebar list (id + display_name)
+  const [tables, setTables] = useState<ObjectSummary[]>([]);
   const [currentTableId, setCurrentTableId] = useState<string | null>(null);
-  const [gridData, setGridData] = useState<any>({ columns: [], rows: [] });
+  const [gridData, setGridData] = useState<GridData>({ columns: [], rows: [] });
   const [status, setStatus] = useState<string>('');
+  const [view,setView]=useState<'data'|'activity'|'history'>('data');
+  const [history,setHistory]=useState<OperationRecord[]>([]);
+  useEffect(()=>{if(view==='history')void commands.listOperations().then(setHistory).catch(()=>setStatus('Unable to load operation history'))},[view]);
 
   const handleNewWorkbook = async () => {
     const name = prompt('Workbook name (e.g. My CRM)') || 'My CRM';
@@ -17,7 +23,8 @@ function App() {
       setStatus('✓ Workbook created!');
       setTimeout(() => setStatus(''), 3000);
     } catch (e) {
-      setStatus('Error: ' + (e as Error).message);
+      const error = e as RowvaError;
+      setStatus(`Error [${error.code ?? 'unknown'}]: ${error.message ?? String(e)}`);
     }
   };
 
@@ -106,7 +113,9 @@ const handleAddRow = async () => {
               </div>
             </div>
 
-            <div className="flex gap-8">
+            <nav className="flex gap-2 mb-6" aria-label="Workspace views">{(['data','activity','history'] as const).map(item=><button key={item} onClick={()=>setView(item)} className={`px-4 py-2 rounded capitalize ${view===item?'bg-emerald-600':'bg-zinc-800'}`}>{item==='activity'?'Agent Activity':item==='history'?'Operation History':'Data'}</button>)}</nav>
+
+            {view==='activity'?<AgentActivity onCommitted={()=>currentTableId&&void refreshGrid(currentTableId)}/>:view==='history'?<div className="border border-zinc-800 rounded bg-zinc-900"><h2 className="text-xl p-4 border-b border-zinc-800">Operation history</h2>{history.map(op=><div key={op.id} className="p-4 border-b border-zinc-800"><div className="flex justify-between"><span className="capitalize">{op.kind.replaceAll('_',' ')}</span><span>{op.status}</span></div><div className="text-xs text-zinc-500">{op.actor.display_name} · {new Date(op.created_at).toLocaleString()} · {op.id}</div>{op.reason&&<p className="text-sm mt-1">{op.reason}</p>}</div>)}</div>:<div className="flex gap-8">
               {/* Sidebar - Tables (Grist-style) */}
               <div className="w-64 bg-zinc-900 border border-zinc-800 rounded p-4 h-fit">
                 <div className="flex justify-between items-center mb-4">
@@ -166,6 +175,7 @@ const handleAddRow = async () => {
                 )}
               </div>
             </div>
+            }
           </>
         )}
 

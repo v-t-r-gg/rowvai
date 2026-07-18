@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from '@tanstack/react-table';
 import { commands } from '../lib/tauri';
-import type { GridData } from '../types/rowva';
+import type { GridData, RecordData } from '../types/rowva';
 
 type Props = { 
   data: GridData; 
@@ -12,7 +12,6 @@ type Props = {
 interface EditingCell {
   rowId: string;
   colId: string;
-  colLabel: string;
   initialValue: string;
 }
 
@@ -20,16 +19,16 @@ export default function Grid({ data, onDataChange, tableId }: Props) {
   const [editing, setEditing] = useState<EditingCell | null>(null);
   const [editValue, setEditValue] = useState('');
 
-  const columnHelper = createColumnHelper<any>();
+  const columnHelper = createColumnHelper<RecordData>();
 
   const columns = data.columns.map((col: any) =>
-    columnHelper.accessor(col.label, {
+    columnHelper.accessor(row => row.values[col.id], {
       id: col.id,
       header: col.label,
       cell: (info) => {
-        const rowId = (info.row.original as any).row_id;
+        const rowId = info.row.original.record_id;
+        const revision = info.row.original.revision;
         const colId = col.id;
-        const colLabel = col.label;
         const value = info.getValue() || '';
 
         const isEditingThis = editing?.rowId === rowId && editing?.colId === colId;
@@ -40,10 +39,10 @@ export default function Grid({ data, onDataChange, tableId }: Props) {
               autoFocus
               value={editValue}
               onChange={(e) => setEditValue(e.target.value)}
-              onBlur={() => commitEdit(rowId, colId)}
+              onBlur={() => commitEdit(rowId, colId, revision)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
-                  commitEdit(rowId, colId);
+                  commitEdit(rowId, colId, revision);
                 } else if (e.key === 'Escape') {
                   cancelEdit();
                 }
@@ -56,9 +55,9 @@ export default function Grid({ data, onDataChange, tableId }: Props) {
         return (
           <div
             className="px-4 py-2 cursor-text hover:bg-zinc-800 min-h-[34px]"
-            onDoubleClick={() => startEdit(rowId, colId, colLabel, String(value))}
+            onDoubleClick={() => startEdit(rowId, colId, String(value))}
           >
-            {value || '—'}
+            {value == null || value === '' ? '—' : String(value)}
           </div>
         );
       },
@@ -71,17 +70,17 @@ export default function Grid({ data, onDataChange, tableId }: Props) {
     getCoreRowModel: getCoreRowModel(),
   });
 
-  function startEdit(rowId: string, colId: string, colLabel: string, initialValue: string) {
-    setEditing({ rowId, colId, colLabel, initialValue });
+  function startEdit(rowId: string, colId: string, initialValue: string) {
+    setEditing({ rowId, colId, initialValue });
     setEditValue(initialValue);
   }
 
-  async function commitEdit(rowId: string, colId: string) {
+  async function commitEdit(rowId: string, colId: string, expectedRevision: number) {
     if (!editing || !tableId) return;
     const newValue = editValue;
 
     try {
-      await commands.updateCell(tableId, rowId, colId, newValue);
+      await commands.updateCell(tableId, rowId, colId, newValue, expectedRevision);
       setEditing(null);
       setEditValue('');
       onDataChange(); // refresh grid
